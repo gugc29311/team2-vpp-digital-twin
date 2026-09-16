@@ -34,3 +34,17 @@ Validated SimPy-Based Digital Twin of VPP Foundry Operations
 ## 참고
 
 기업 원본 자료 및 보안 필요 자료는 본 레포에 업로드하지 않습니다.
+
+## 현재 버전
+
+v0.0.1 (개발 초기 단계)
+
+## 설치 방법
+
+git clone https://github.com/gugc29311/team2-vpp-digital-twin.git
+cd team2-vpp-digital-twin
+pip install -r requirements.txt
+
+## 실행 방법
+
+(추후 작성 예정)

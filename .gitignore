@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Simulation outputs (python main.py 실행 결과)
+outputs/

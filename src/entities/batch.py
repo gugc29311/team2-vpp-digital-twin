@@ -23,6 +23,7 @@ class Batch:
     build_time: Optional[float] = None
     print_start: Optional[float] = None
     print_end: Optional[float] = None
+    urgent: bool = False                 # 긴급 전용 배치 (URGENT_BATCH_MAX_WAIT_TIME 사용 시)
 
     @property
     def closed(self):
@@ -44,3 +45,8 @@ class Batch:
     @property
     def earliest_due(self):
         return min(p.order.due_date for p in self.parts)
+
+    @property
+    def has_urgent(self):
+        """긴급 주문 부품이 하나라도 있으면 True (URGENT_FIRST 규칙용)."""
+        return any(p.order.is_urgent for p in self.parts)

@@ -16,6 +16,33 @@ import os
 
 import numpy as np
 
+def _level_series(intervals):
+    """[(시작, 끝 또는 None), ...] -> 동시 개수 계단함수 [(t, 개수)]. 끝이 None이면 진행 중."""
+    ev = sorted([(s, 1) for s, e in intervals] + [(e, -1) for s, e in intervals if e is not None])
+    lvl, out = 0, []
+    for t, d in ev:
+        lvl += d
+        out.append((t, lvl))
+    return out
+
+
+def _step_stats(series, t0, t1):
+    """계단함수의 [t0, t1] 시간평균·최대. 구간 길이 0 (예: 주문 0건 csv) 이면 NaN."""
+    if t1 <= t0:
+        return float("nan"), float("nan")
+    area, last_t, w, peak = 0.0, t0, 0, 0
+    for t, nw in series:
+        if t <= t0:
+            w = nw
+            continue
+        if t >= t1:
+            break
+        area += w * (t - last_t)
+        peak = max(peak, w)
+        last_t, w = t, nw
+    peak = max(peak, w)
+    area += w * (t1 - last_t)
+    return area / (t1 - t0), peak
 
 def measure_start(res):
     """측정 시작 시각: random 모드 = WARMUP_TIME, csv 모드 = 0 (검증용 CSV 는 워밍업 없이 전체 집계)."""
@@ -137,10 +164,35 @@ def kpis(res):
     stats([o for o in done if o.reworks > 0], "lead_work_rework_h")
     lc = np.array([o.completed_time - o.arrival_time for o in done]) if done else np.array([nan])
     k["lead_calendar_h_mean"], k["lead_calendar_h_p95"] = float(lc.mean()), float(np.percentile(lc, 95))
-    on = lambda os_: float(np.mean([o.completed_time <= o.due_date + 1e-9 for o in os_])) if os_ else nan
-    k["on_time_all"] = on(done)
-    k["on_time_urgent"] = on([o for o in done if o.is_urgent])
-    k["on_time_normal"] = on([o for o in done if not o.is_urgent])
+
+    def on(os_all):
+        """납기 준수율. 미완료인데 납기가 지난 주문은 지연으로 센다."""
+        fin = [o for o in os_all if o.completed_time is not None]
+        late_open = [o for o in os_all if o.completed_time is None and o.due_date < t1]
+        n = len(fin) + len(late_open)
+        return sum(o.completed_time <= o.due_date + 1e-9 for o in fin) / n if n else nan
+    k["on_time_all"] = on(arrived)
+    k["on_time_urgent"] = on([o for o in arrived if o.is_urgent])
+    k["on_time_normal"] = on([o for o in arrived if not o.is_urgent])
+
+    # 처리량 · Tardiness (근무시간)
+    # 끝 시각 포함: csv 모드는 마지막 주문 완료 시각 = 종료 시각
+    k["throughput_per_week"] = (sum(1 for o in res.orders if o.completed_time is not None
+                                    and t0 <= o.completed_time <= t1) / weeks) if weeks else nan
+    late = [cal.work_hours(o.due_date, o.completed_time) if o.completed_time > o.due_date + 1e-9 else 0.0
+            for o in done]
+    k["tardiness_work_h_mean"] = float(np.mean(late)) if late else nan
+    k["tardiness_work_h_total"] = float(np.sum(late)) if late else nan
+
+    # WIP (시간평균) + Little 법칙 교차검증, 프린터 대기열·대기시간
+    wip = _level_series([(o.arrival_time, o.completed_time) for o in res.orders])
+    k["wip_mean"], k["wip_max"] = _step_stats(wip, t0, t1)
+    k["wip_little"] = len(arrived) / (t1 - t0) * k["lead_calendar_h_mean"] if t1 > t0 else nan  # λ(달력) x W(달력)
+    q = _level_series([(b.closed_time, b.print_start) for b in res.batches if b.closed_time is not None])
+    k["printer_queue_mean"], k["printer_queue_max"] = _step_stats(q, t0, t1)
+    pw = [b.print_start - b.closed_time for b in bs if b.print_start is not None]
+    k["printer_wait_h_mean"] = float(np.mean(pw)) if pw else nan
+    k["printer_wait_h_p95"] = float(np.percentile(pw, 95)) if pw else nan
 
     # 재출력 · 레진
     pp = [rw for t, rw in res.printed_parts if t0 <= t < t1]
@@ -159,6 +211,13 @@ def kpis(res):
             k["washing_liquid_changes_per_week"] = d["clean"] / weeks if weeks else nan
     return k
 
+def bottleneck(res):
+    """부하가 가장 큰 자원 (이름, 값). 프린터는 달력시간 가동률이 아니라 부하율 ρ로 비교."""
+    k, u = kpis(res), utilization(res)
+    cand = {n: v["utilization"] for n, v in u.items() if n != "vpp_printers"}
+    if k["printer_rho"] == k["printer_rho"]:            # NaN 아님
+        cand["vpp_printers"] = k["printer_rho"]
+    return max(cand.items(), key=lambda x: x[1]) if cand else ("", float("nan"))
 
 def zone(u):
     """Hopp & Spearman 판정: <50% 여유 · 50~70% 주의 · ≥70% 위험."""
@@ -206,11 +265,40 @@ def print_summary(res, show_batches=None):
     print("=" * 78)
 
 
-def save_outputs(res, out_dir="outputs"):
+def daily_table(res, day_h=24.0):
+    """달력 1일 단위 시계열: 처리량, 지연 완료 수, WIP, 프린터 대기열, 프린터 가동률."""
+    t0, t1 = measure_start(res), res.end_time
+    wip = _level_series([(o.arrival_time, o.completed_time) for o in res.orders])
+    que = _level_series([(b.closed_time, b.print_start) for b in res.batches if b.closed_time is not None])
+    pr = [(s, e) for r, s, e, _ in res.log.busy if r == "vpp_printers"]
+    cap = res.capacities.get("vpp_printers", 0)
+    rows, a = [], t0
+    while a + 1e-9 < t1:
+        b = min(a + day_h, t1)
+        last = b >= t1                                   # 마지막 날은 종료 시각 포함 (throughput_per_week 와 같은 기준)
+        finished = [o for o in res.orders if o.completed_time is not None
+                    and a <= o.completed_time and (o.completed_time < b or last and o.completed_time <= b)]
+        busy = sum(max(0.0, min(e, b) - max(s, a)) for s, e in pr)
+        rows.append({
+            "day": int((a - t0) // day_h) + 1,
+            "throughput": len(finished),
+            "late_completed": sum(o.completed_time > o.due_date + 1e-9 for o in finished),
+            "wip_mean": round(_step_stats(wip, a, b)[0], 3),
+            "printer_queue_mean": round(_step_stats(que, a, b)[0], 3),
+            "printer_util": round(busy / (cap * (b - a)), 4) if cap else "",
+        })
+        a = b
+    return rows
+
+
+def save_outputs(res, out_dir="outputs", daily=False):
     os.makedirs(out_dir, exist_ok=True)
     if res.log.keep_events:
         res.log.to_csv(os.path.join(out_dir, "event_log.csv"))
-    for name, rows in (("order_summary.csv", order_table(res)), ("batch_summary.csv", batch_table(res))):
+    tables = [("order_summary.csv", order_table(res)), ("batch_summary.csv", batch_table(res))]
+    if daily:
+        tables.append(("daily_summary.csv", daily_table(res)))
+    for name, rows in tables:
         if not rows:
             continue
         with open(os.path.join(out_dir, name), "w", encoding="utf-8-sig", newline="") as f:

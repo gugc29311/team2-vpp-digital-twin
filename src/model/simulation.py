@@ -4,7 +4,7 @@ VPP 공정 시뮬레이션 (SimPy).
 
 흐름
   주문 도착 -> Job Assignment(JA 담당) -> 부품 단위로 배치 형성(면적 S / 대기 T, 같은 재료)
-  -> [배치] (Build Preparation) -> 프린터 대기열(FCFS/SPT/EDD) -> 프린터 풀에서 사용 가능한 프린터 확보
+  -> [배치] (Build Preparation) -> 프린터 대기열(src/scheduler/dispatch.py 규칙) -> 프린터 풀에서 사용 가능한 프린터 확보
      (고장·PM 도래 시 그 프린터는 정비로 보내고 다른 프린터 대기) -> VPP Build (무인운전: 밤에도 진행)
   -> ① 이동 + Part Removal(후공정 담당, 한 번의 점유)
   -> 세척: 로드 분할, 로드마다 ② 이동 -> 세척기 확보(정비 점검) -> 적재 -> 세척 -> 인출 (-> 세척액 교체)
@@ -28,6 +28,7 @@ from src.entities.order import make_parts
 from src.model.config import SimConfig
 from src.model.order_source import check_orders_for_config, load_orders, random_order
 from src.resources.resources import FactoryResources
+from src.scheduler import dispatch
 from src.utils.calendar import make_calendar
 from src.utils.random_utils import make_streams, sample
 
@@ -110,9 +111,11 @@ class VPPSimulation:
             yield req
             wait = self.env.now - t_req
             for i, (task, hours) in enumerate(tasks):
+                yield from self.cal.wait_open(self.env)              # 근무시간이 될 때까지 대기한 뒤 기록
                 start = self.env.now
+                wait = start - t_req if i == 0 else 0.0              # 자원 대기 + 근무시간 대기
                 self.log.add(start, entity_type, entity_id, f"{task}_START", res_name,
-                             f"wait={wait:.2f}h" if i == 0 and wait > 1e-9 else "")
+                            f"wait={wait:.2f}h" if wait > 1e-9 else "")
                 yield from self.cal.delay(self.env, hours)
                 self.log.add(self.env.now, entity_type, entity_id, f"{task}_END", res_name)
                 self.log.add_busy(res_name, start, self.env.now, hours)
@@ -142,11 +145,15 @@ class VPPSimulation:
             return unit
 
     def _service_and_return(self, unit, pool):
+        self.log.add(self.env.now, "MACHINE", unit.name, "MAINTENANCE_START", unit.name)
         yield from unit.service(self.env, self.cal, self.cfg.MAINTENANCE_IN_WORK_HOURS_ONLY)
+        self.log.add(self.env.now, "MACHINE", unit.name, "MAINTENANCE_END", unit.name)
         yield pool.put(unit)
 
     def _clean_and_return(self, unit, pool):
+        self.log.add(self.env.now, "MACHINE", unit.name, "CLEANING_START", unit.name)
         yield from unit.clean(self.env, self.cal, self._t(self.cfg.CLEANING_LIQUID_CHANGE_TIME))
+        self.log.add(self.env.now, "MACHINE", unit.name, "CLEANING_END", unit.name)
         yield pool.put(unit)
 
     # =====================================================
@@ -182,8 +189,13 @@ class VPPSimulation:
     # =====================================================
     # 배치 형성 (도착 순서대로 채움)
     # =====================================================
+    def _is_urgent_part(self, part):
+        """긴급 전용 배치로 보낼 부품인지 (URGENT_BATCH_MAX_WAIT_TIME 이 있을 때만)."""
+        return self.cfg.URGENT_BATCH_MAX_WAIT_TIME is not None and part.order.is_urgent
+
     def _batch_key(self, part):
-        return part.material if self.cfg.BATCH_SAME_MATERIAL_ONLY else "ALL"
+        key = part.material if self.cfg.BATCH_SAME_MATERIAL_ONLY else "ALL"
+        return (key, "URGENT") if self._is_urgent_part(part) else key
 
     def _overflows(self, b, part):
         c = self.cfg
@@ -209,20 +221,24 @@ class VPPSimulation:
             b = None
         if b is None:
             self._batch_seq += 1
-            b = Batch(f"B{self._batch_seq:05d}", part.material if key != "ALL" else "MIXED", self.env.now)
+            urgent = self._is_urgent_part(part)
+            b = Batch(f"B{self._batch_seq:05d}", part.material if self.cfg.BATCH_SAME_MATERIAL_ONLY else "MIXED",
+                      self.env.now, urgent=urgent)
             self.open_batches[key] = b
             self.batches.append(b)
-            self.log.add(self.env.now, "BATCH", b.batch_id, "BATCH_OPENED", "", f"material={b.material}")
-            if self.cfg.BATCH_MAX_WAIT_TIME is not None:
-                self.env.process(self._batch_timer(b))
+            self.log.add(self.env.now, "BATCH", b.batch_id, "BATCH_OPENED", "",
+                         f"material={b.material}" + (" urgent" if urgent else ""))
+            wait = self.cfg.URGENT_BATCH_MAX_WAIT_TIME if urgent else self.cfg.BATCH_MAX_WAIT_TIME
+            if wait is not None:
+                self.env.process(self._batch_timer(b, wait))
         b.parts.append(part)
         self.log.add(self.env.now, "PART", part.part_id, "ADDED_TO_BATCH", "", b.batch_id)
         trig = self._full_trigger(b)
         if trig:
             self._close_batch(b, trig)
 
-    def _batch_timer(self, b):
-        yield from self.cal.delay(self.env, self._t(self.cfg.BATCH_MAX_WAIT_TIME))
+    def _batch_timer(self, b, wait_spec):
+        yield from self.cal.delay(self.env, self._t(wait_spec))
         if not b.closed:
             self._close_batch(b, "TIME")
 
@@ -246,12 +262,7 @@ class VPPSimulation:
         return self._t(c.BUILD_SETUP_TIME) + layers * self._t(c.TIME_PER_LAYER)
 
     def _priority(self, b):
-        rule = self.cfg.DEFAULT_SCHEDULING_RULE
-        if rule == "SPT":
-            return b.build_time
-        if rule == "EDD":
-            return b.earliest_due
-        return self._request_seq
+        return dispatch.priority(self.cfg.DEFAULT_SCHEDULING_RULE, b, self._request_seq)
 
     def _batch_flow(self, b):
         c, env = self.cfg, self.env
@@ -263,6 +274,7 @@ class VPPSimulation:
         b.build_time = self._build_time(b)
         self._request_seq += 1
         t_req = env.now
+        self.log.add(env.now, "BATCH", b.batch_id, "PRINTER_QUEUE_ENTER", "vpp_printers")
         with self.res.vpp_printers.request(priority=self._priority(b)) as req:
             yield req
             unit = yield from self._get_unit("vpp_printers")
@@ -346,6 +358,7 @@ class VPPSimulation:
         handling = self._t(c.LOAD_HANDLING_TIME)
         proc = self._t(time_spec)
         pool = self.res.pools[machine]
+        self.log.add(self.env.now, "LOAD", load_id, f"{task}_QUEUE_ENTER", machine)
         with getattr(self.res, machine).request() as req:
             yield req
             unit = yield from self._get_unit(machine)
@@ -372,6 +385,7 @@ class VPPSimulation:
         t_req = env.now
         with self.res.quality_inspectors.request() as req:
             yield req
+            yield from self.cal.wait_open(env)                   # 근무시간이 될 때까지 대기한 뒤 기록
             start = env.now
             self.log.add(start, "PART", p.part_id, "INSPECTION_START", "quality_inspectors",
                          f"wait={start - t_req:.2f}h" if start - t_req > 1e-9 else "")
@@ -382,6 +396,7 @@ class VPPSimulation:
                          "FAIL" if defect else "PASS")
             self.log.add_busy("quality_inspectors", start, env.now, d)
             if not defect and self.res.packers is None:
+                yield from self.cal.wait_open(env)
                 ps = env.now
                 self.log.add(ps, "PART", p.part_id, "PACKAGING_START", "quality_inspectors")
                 d = self._t(c.PACKAGING_TIME)

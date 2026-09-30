@@ -15,9 +15,15 @@ import copy
 from dataclasses import dataclass, field
 
 import config.parameters as P
+from src.scheduler.dispatch import RULES
 from src.utils.random_utils import parse as parse_dist
 
-_VALID_RULES = {"FCFS", "SPT", "EDD"}
+_VALID_RULES = set(RULES)
+
+# parameters.py 에 없는 새 설정의 기본값 (기존 동작 유지). parameters.py 에 같은 이름이 있으면 그 값이 우선.
+#   URGENT_BATCH_MAX_WAIT_TIME : None = 긴급·일반 부품을 같은 배치에 섞음 (기존)
+#                                분포   = 긴급 부품은 긴급 전용 배치로 모으고 이 대기 한도(T 조건)를 적용
+DEFAULTS = {"URGENT_BATCH_MAX_WAIT_TIME": None}
 _DIST_KINDS = {"const", "tri", "uniform", "exp"}
 _EQUIP_KEYS = {"mtbf", "repair", "pm_every", "pm", "pm_offsets"}
 
@@ -41,7 +47,8 @@ class SimConfig:
     @classmethod
     def from_parameters(cls):
         """parameters.py 의 대문자 변수 전체를 읽어 설정 객체 생성."""
-        vals = {k: copy.deepcopy(getattr(P, k)) for k in dir(P) if k.isupper()}
+        vals = copy.deepcopy(DEFAULTS)
+        vals.update({k: copy.deepcopy(getattr(P, k)) for k in dir(P) if k.isupper()})
         cfg = cls(vals)
         cfg.validate()
         return cfg

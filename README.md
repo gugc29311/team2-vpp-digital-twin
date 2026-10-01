@@ -2,9 +2,6 @@
 
 VPP(Vat Photopolymerization) 공정 SimPy 시뮬레이션. ㈜링크솔루션 연계 캡스톤디자인.
 현재 버전 **v0.1.0** (변경 내역: [CHANGELOG.md](CHANGELOG.md)).
-파라미터는 가정값 로그(`vpp-assumptions-log.md`)의 **가정값**(인터뷰 확인 전) — 근거·검증 결과는 로그 참고.
-
-> **처음이라면 [GUIDE.md](GUIDE.md)부터** — 전체 흐름, 핵심 개념, 파일별 설명, 자주 하는 작업이 정리되어 있습니다.
 
 ## 실행 (반드시 프로젝트 최상위 폴더에서)
 
@@ -16,16 +13,21 @@ python main.py --mode random --scenario "High Demand"
 python main.py --mode random --reps 30          # 30회 독립 반복 + 95% CI (병렬, 8코어 약 1분 · 4코어 약 8분)
 python main.py --mode random --weeks 2 --keep-events   # 2주만 실행 + 이벤트 로그 저장
 python main.py --preset "Rush Order" --reps 30  # 실험 프리셋: Normal λ + 긴급 비율 30% (가정값)
+python main.py --quiet --at "Day 2 10:00"       # 시각 조회: 그 시각의 주문 위치·설비 상태·작업자·대기열 (csv 또는 --keep-events)
+python main.py --quiet --trace O001             # 주문 1건 전체 이벤트 추적 (명세서 14절 Level 2)
 python -m src.analysis.capacity                 # 프린터 유효 처리용량 재측정 (설비·캘린더·고장 설정 변경 시)
-python -m pytest                                # 로직 테스트 (1초 미만)
-python -m pytest -m slow                        # 가정값 회귀 테스트 (약 15초)
+python -m pytest                                # 로직 테스트 (수십 초 이내)
+python -m pytest -m slow                        # 가정값 회귀 테스트 (약 30초~1분)
 ```
 
 - `python src/model/simulation.py` 처럼 파일 경로로 실행하면 `ModuleNotFoundError: config` — `python -m ...` 사용.
 - `--reps` 병렬 실행은 스크립트로만 동작 (Jupyter 셀에서는 `run_replications(cfg, jobs=1)` 로 순차 실행).
 - 결과: `outputs/` 에 `order_summary.csv`, `batch_summary.csv` (+ csv 모드·`--keep-events` 는 `event_log.csv`,
   random 모드는 `daily_summary.csv`, `--reps` 는 `replications_<시나리오>.csv`).
-- 옵션 조합 오류는 실행 전에 멈춤(종료코드 2): `--orders` + random 모드, `--reps` 없는 `--jobs`, csv 모드의 `--weeks`, `--preset` + csv 모드 또는 `--scenario`.
+- 옵션 조합 오류는 실행 전에 멈춤(종료코드 2): `--orders` + random 모드, `--reps` 없는 `--jobs`, csv 모드의 `--weeks`,
+  `--preset` + csv 모드 또는 `--scenario`, 이벤트 로그 없는 `--at`·`--trace`(random 모드에 `--keep-events` 없음), `--at`·`--trace` + `--reps`.
+- `event_log.csv` 열: `sim_time, order_id, entity_type, entity_id, event, process, location, state, resource, detail`
+  (resource = 작업자 개인 ID `JA1`/`PP2`/`QI1` 또는 설비 `P1`/`WASH1`/`UV1`, 설비 상태 6종 Idle/Setup/Running/Waiting/Down/Maintenance).
 
 ## 폴더 구조
 
@@ -35,15 +37,17 @@ data/sample_orders.csv        공정 통과 확인용 주문 10건 (재료 2종,
 main.py                       실행 진입점
 src/entities/order.py         Order(주문), Part(부품)
 src/entities/batch.py         Batch(빌드플레이트 1장)
-src/resources/resources.py    설비(대기열 + 설비 객체 풀, 대당 고장·PM 추적)·인력 자원
+src/resources/resources.py    설비(대기열 + 설비 객체 풀, 대당 고장·PM·상태 추적)·인력 자원(대기열 + 개인 ID)
 src/model/config.py           SimConfig — 값을 바꿔 실험할 때 사용, 설정 검증
 src/model/order_source.py     CSV 읽기 / 무작위 주문 생성 (근무일 기준 납기)
 src/model/simulation.py       공정 흐름 (VPPSimulation)
 src/scheduler/dispatch.py     프린터 대기열 규칙 (FCFS / SPT / EDD / URGENT_FIRST)
 src/utils/random_utils.py     분포 정의 -> 난수, 용도별 독립 난수 스트림
 src/utils/calendar.py         근무 캘린더 (근무시간 소비, 근무시간 더하기)
-src/analysis/event_log.py     이벤트 로그
-src/analysis/kpi.py           KPI (가동률, 부하율 ρ, 리드타임, 납기, 레진, 고장)
+src/analysis/event_log.py     이벤트 로그 (명세서 10절 형식)
+src/analysis/event_schema.py  이벤트 -> 공정명·상태 규칙
+src/analysis/kpi.py           KPI (가동률, 부하율 ρ, 리드타임, 납기, 대기, 장비 상태, 작업자, 레진, 고장)
+src/logger/state.py           시각 조회 state_at(res, t) — OME Time Query
 src/analysis/capacity.py      프린터 유효 처리용량 측정
 src/experiments/replications.py  30회 독립 반복 · 95% CI · 예측구간
 src/experiments/scenarios.py  실험 프리셋 (Rush Order 등, parameters.py 수정 없이 설정 묶음)
@@ -82,5 +86,5 @@ print(kpis(VPPSimulation(cfg, keep_events=False).run()))
 ## CSV 형식
 
 필수: `order_id, product_id, arrival_time, quantity, material, due_date, priority` / 선택: `area_mm2, height_mm`
-(면적 기준 배치·height 출력시간 모드에서는 필수). `arrival_time`, `due_date` 는 시뮬레이션 시각 절대값(hour).
+(면적 기준 배치·height 출력시간 모드에서는 필수), `required_process` (필요한 후공정 `;` 구분, 비우면 전체). `arrival_time`, `due_date` 는 시뮬레이션 시각 절대값(hour).
 `priority` 는 `NORMAL`/`URGENT`. 엑셀 "CSV UTF-8" 저장 파일도 그대로 읽힘.

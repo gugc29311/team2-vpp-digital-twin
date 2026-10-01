@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.1.0 - 2026.10.01
+
+### Added
+- 주문 속성 [명세서 4절]
+  - `Order.required_process`: 필요한 후공정. 기본 = 전체, 서포트 제거·표면처리만 생략 가능. CSV 선택 열 `required_process`
+  - `Order.estimated_build_time`: 부품 높이로 계산한 단독 출력 예상시간
+  - `Order.current_process`, `Order.current_state`: 현재 공정·상태
+  - `order_summary.csv`에 위 항목과 `product_id` 열 추가
+- KPI [명세서 12절]: 처리량, Tardiness, WIP(Little 법칙 포함), 프린터·세척·UV·인력별 대기시간·대기열 길이
+- 작업자 개인 ID (`JA1..`, `PP1..`, `QI1..`, `PK1..`): 이벤트에 누가 했는지 기록, 개인별 가동률 [명세서 1·10절]
+- 장비 상태 6종 (Idle / Setup / Running / Waiting / Down / Maintenance): 상태 전환 이벤트, 상태별 시간 KPI.
+  프린터 출력 = 셋업 + 층 출력 분리, 고장(`DOWN`)과 PM(`MAINTENANCE`) 구분 [명세서 11절]
+- 이벤트 로그 권장 형식: `sim_time, order_id, entity_type, entity_id, event, process, location, state`
+  (+ `resource, detail`). `parameters.LOCATIONS`는 가정 방 이름 [명세서 8.1·10절]
+- OME 시각 조회: `state_at(res, t)`, `main.py --at "Day 3 14:25"` (주문 위치·WIP·설비 상태·작업자·대기 수·레진) [명세서 1·15·18절]
+- 주문 추적: `main.py --trace O001` [명세서 14절 Level 2]
+- 불변식 검사 `check(res)`: 용량·근무시간·주문 보존·작업자 작업 겹침·공정 순서·이동 순서 [명세서 14절 Level 3]
+- 프린터 0대 허용 (생산량 0, 오류 없음) [명세서 14절 Level 5]
+- 프린터 대기열 규칙 `URGENT_FIRST` 추가, 규칙은 `src/scheduler/dispatch.py`로 분리 [명세서 6절]
+- 긴급 전용 배치 설정 `URGENT_BATCH_MAX_WAIT_TIME` (기본값 `None` = 혼합 배치). 실험 결과 기본값 유지 권장 (GUIDE §6)
+- 실험 프리셋 `main.py --preset` (`Rush Order` = Normal + 긴급 30%)
+- `bottleneck(res)`, 일별 표 `daily_summary.csv`, 반복별 결과 `replications_<시나리오>.csv`
+- `main.py` 옵션: `--keep-events`, `--weeks`, `--reps`
+
+### Changed
+- 인력 자원: 역할 단위 대기열 + 개인 ID. 빈 사람 중 번호가 가장 작은 사람에게 배정 (KPI 불변) [명세서 1·10절]
+- 이벤트 로그 열 순서·이름을 권장 형식으로 변경 [명세서 10절]
+- `on_time_*`: 종료 시 미완료인데 납기가 지난 주문을 지연으로 셈
+- 장비 상태: 세척·UV 적재·인출이 점심·퇴근에 걸려 멈춘 시간을 Setup이 아니라 Waiting으로 집계 [명세서 11절]
+
+### Fixed
+- `kpis()`에서 빠졌던 리드타임 KPI(`lead_work_h_*`, `lead_calendar_h_*` 등) 복원
+- 처리량·일별 표에서 종료 시각에 완료된 마지막 주문이 빠지던 문제
+- 주문 0건일 때 `kpis()`의 `ZeroDivisionError`
+
+### Tests
+- `test_order_model.py`: 주문 속성 [명세서 4절]
+- `test_simple_case.py`: 명세서 예시 손계산(프린터 1대·주문 2개), 주문 1건 이벤트 39개 = 손계산 [명세서 14절 Level 2·4]
+- `test_invariants.py`: 설정 12종에서 위반 0건, 조작한 결과 검출 [Level 3]
+- `test_kpi_events.py`: KPI 손계산, Little 법칙, 이벤트 형식 [명세서 10·12절]
+- `test_workers.py`: 작업자 ID·배정·작업 겹침 검출 [Level 3]
+- `test_machine_states.py`: 장비 상태 구간·고장·PM [명세서 11절]
+- `test_state_query.py`: 시각 조회 결과를 시뮬레이션 기록과 대조 [Level 2, 18절]
+- `test_scheduling.py`: FCFS/SPT/EDD/URGENT_FIRST 출력 순서 = 손계산
+- `test_urgent_batch.py`, `test_scenarios.py`: 긴급 배치·프리셋
+- `test_extreme.py`: 수요 0, 자원 무한 → 대기 0, 과부하 → WIP 누적, 프린터 0대 → 완료 0 [명세서 14절 Level 5]
+
 ## v0.0.3 — 2026.09.30
 ### Added
 - KPI: `throughput_per_week`, `tardiness_work_h_mean/total`, `wip_mean/max/little`,

@@ -128,6 +128,23 @@ PRINTER_UNATTENDED = True            # 투입은 근무시간에만, 출력은 �
 TRANSPORT_ENABLED = True
 DEFAULT_TRANSPORT_TIME = ("tri", 1, 2, 4, "min")    # ⚠️ 레이아웃 의존
 
+# 공정(명세서 8.1절) -> 방 이름. 이벤트 로그 location 열에만 쓰임 (좌표·거리·이동시간과 무관)
+# ⚠️ 가정값 — 실제 공장 배치는 인터뷰 확인 필요
+LOCATIONS = {
+    "Order Reception": "Order Desk",
+    "Job Assignment": "Order Desk",
+    "Batch Formation": "Order Desk",
+    "VPP Build": "Print Room",
+    "Part Removal": "Post-processing Room",
+    "Washing": "Wash Room",
+    "UV Curing": "UV Room",
+    "Support Removal": "Post-processing Room",
+    "Surface Treatment": "Post-processing Room",
+    "Inspection": "Inspection Room",
+    "Packaging": "Packing Room",
+    "Transport": "Corridor",
+}
+
 # =========================================================
 # Scheduling  [공통2 · 공통7]
 # =========================================================

@@ -6,6 +6,7 @@
 """
 import pytest
 
+from src.analysis.event_log import Event
 from src.model.config import SimConfig
 from src.model.simulation import VPPSimulation
 from src.validation.invariants import check
@@ -75,15 +76,35 @@ def test_detects_mixed_material(run_logic):
 
 def test_detects_off_hours_start(run_logic):
     res = run_logic(USE_WORK_CALENDAR=True)
-    _, *rest = next(e for e in res.log.events if e[3] == "INSPECTION_START")
+    ev = next(e for e in res.log.events if e.event == "INSPECTION_START")
     assert not res.calendar.is_open(10.0)                       # t=10 = 월 19:00
-    res.log.events.append((10.0, *rest))
+    res.log.events.append(ev._replace(sim_time=10.0))
     assert any("근무시간 밖" in m for m in check(res))
+
+
+def _shift(res, event, dt):
+    i, ev = next((i, e) for i, e in enumerate(res.log.events) if e.event == event)
+    res.log.events[i] = ev._replace(sim_time=ev.sim_time + dt)
+
+
+@pytest.mark.parametrize("event, dt, label", [
+    ("TRANSPORT_2_TO_WASHING_END", 0.3, "이동② 도착 -> 세척 대기열"),      # 도착 전에 세척 대기열 진입
+    ("TRANSPORT_5_TO_INSPECTION_END", 1.0, "이동⑤ 도착 -> 검사 시작"),      # 도착 전에 검사 시작
+    ("TRANSPORT_1_PRINT_TO_REMOVAL_START", -2.0, "출력 종료 -> 이동① 출발"),  # 출력 끝나기 전에 출발
+])
+def test_detects_transport_order_violation(run_logic, event, dt, label):
+    """명세서 14절 L3 '이동하기 전에 다음 위치 도착'."""
+    from src.validation.invariants import check_transport
+    res = run_logic()
+    assert check_transport(res) == []
+    _shift(res, event, dt)
+    assert any(label in m for m in check_transport(res))
 
 
 def test_detects_start_during_downtime(run_logic):
     res = run_logic(BREAKDOWN_ENABLED=True, EQUIPMENT_FAILURE=FAIL)
     u = next(u for u in res.units if u.log)
     _, s, e = u.log[0]
-    res.log.events.append((round((s + e) / 2, 6), "BATCH", "BX", "VPP_BUILD_START", u.name, ""))
+    res.log.events.append(Event(round((s + e) / 2, 6), "", "BATCH", "BX", "VPP_BUILD_START", "VPP Build",
+                                "Print Room", "Processing", u.name, ""))
     assert any("중" in m and u.name in m for m in check(res))

@@ -1,7 +1,8 @@
 # Team 2 VPP Digital Twin
 
 VPP(Vat Photopolymerization) 공정 SimPy 시뮬레이션. ㈜링크솔루션 연계 캡스톤디자인.
-현재 버전 **v0.1.0** (변경 내역: [CHANGELOG.md](CHANGELOG.md)).
+
+현재 버전 **v0.1.1** (변경 내역: [CHANGELOG.md](CHANGELOG.md)).
 대시보드(KPI · 시간 추이 · 장비 상태 타임라인 · 2D/3D Factory Replay)는 아래 [대시보드](#대시보드) 참고.
 
 ## 실행 (반드시 프로젝트 최상위 폴더에서)
@@ -26,12 +27,12 @@ python -m pytest -m slow                        # 가정값 회귀 테스트 (�
 - `--reps` 병렬 실행은 스크립트로만 동작 (Jupyter 셀에서는 `run_replications(cfg, jobs=1)` 로 순차 실행).
 - 결과: `outputs/` 에 `order_summary.csv`, `batch_summary.csv` (+ csv 모드·`--keep-events` 는 `event_log.csv`,
   random 모드는 `daily_summary.csv`, `--reps` 는 `replications_<시나리오>.csv`).
+- 옵션 조합 오류는 실행 전에 멈춤(종료코드 2): `--orders` + random 모드, `--reps` 없는 `--jobs`, csv 모드의 `--weeks`,
+  `--preset` + csv 모드 또는 `--scenario`, 이벤트 로그 없는 `--at`·`--trace`(random 모드에 `--keep-events` 없음), `--at`·`--trace` + `--reps`.
 - `event_log.csv` 열: `sim_time, order_id, entity_type, entity_id, event, process, location, state, resource, detail`
   (resource = 작업자 개인 ID `JA1`/`PP2`/`QI1` 또는 설비 `P1`/`WASH1`/`UV1`, 설비 상태 6종 Idle/Setup/Running/Waiting/Down/Maintenance).
   location 은 `parameters.LOCATIONS` 의 가정 방 이름. 주문은 온라인 접수라 주문 데스크가 없고,
   Order Reception · Job Assignment · Batch Formation 은 `Print Room` 으로 기록.
-- `event_log.csv` 열: `sim_time, order_id, entity_type, entity_id, event, process, location, state, resource, detail`
-  (resource = 작업자 개인 ID `JA1`/`PP2`/`QI1` 또는 설비 `P1`/`WASH1`/`UV1`, 설비 상태 6종 Idle/Setup/Running/Waiting/Down/Maintenance).
 
 ## 폴더 구조
 
@@ -52,16 +53,17 @@ src/analysis/event_log.py     이벤트 로그 (명세서 10절 형식)
 src/analysis/event_schema.py  이벤트 -> 공정명·상태 규칙
 src/analysis/kpi.py           KPI (가동률, 부하율 ρ, 리드타임, 납기, 대기, 장비 상태, 작업자, 레진, 고장)
 src/logger/state.py           시각 조회 state_at(res, t) — OME Time Query
-dashboard/app.py              Streamlit 대시보드 화면 (탭 5개)
-dashboard/data.py             대시보드용 실행·표 가공, Replay 시각별 상태 재구성 (방 배치 ROOM_LAYOUT)
-dashboard/replay.py           2D Factory Replay (plotly 애니메이션)
-dashboard/replay3d.py         3D Factory Replay (Canvas 직접 렌더링, 외부 3D 라이브러리 없음)
 src/analysis/capacity.py      프린터 유효 처리용량 측정
 src/experiments/replications.py  30회 독립 반복 · 95% CI · 예측구간
 src/experiments/scenarios.py  실험 프리셋 (Rush Order 등, parameters.py 수정 없이 설정 묶음)
 src/validation/invariants.py  불변식 검사 check(res) (용량 초과·재료 혼합·정비 중 작업 등)
+dashboard/app.py              Streamlit 대시보드 화면 (탭 5개)
+dashboard/data.py             대시보드용 실행·표 가공, Replay 시각별 상태 재구성 (방 배치 ROOM_LAYOUT)
+dashboard/replay.py           2D Factory Replay (plotly 애니메이션)
+dashboard/replay3d.py         3D Factory Replay (Canvas 직접 렌더링, 외부 3D 라이브러리 없음)
 tests/                        로직 테스트 (고정 설정) + 회귀 테스트 (가정값, -m slow)
 ```
+
 ## 대시보드
 
 ```bash
@@ -84,7 +86,7 @@ Factory Replay (2D · 3D 공통)
 - 날짜 선택 없이 **전체 기간(Day 1 09:00 ~ 종료)을 연속 재생**. 슬라이더의 `D1(월)`, `D2(화)` … 는 각 날짜의 시작.
 - 시간 간격 15/30/60/120분 (기본: 1주 = 30분, 2주 이상 = 60분). 프레임이 1000개를 넘으면 느려질 수 있어 경고 표시.
 - 방 배치(위치 · 크기)는 화면용 임의 배치 ⚠️ (모델에는 좌표 없이 공정 -> 방 이름만 있음, 실제 배치는 인터뷰 확인 필요).
-- 아래의 "주문 추적" 에서 주문 ID 를 입력하면 해당 주문의 전체 이벤트 표시 [명세서 14절 Level 2].
+- 2D Replay 탭 아래의 "주문 추적" 에서 주문 ID 를 입력하면 해당 주문의 전체 이벤트 표시 [명세서 14절 Level 2].
 
 3D 공장 Replay
 - 설비 = 상자(상태 6종 색, 가동 중 초록 불 · 고장 빨간 불), 작업자 = 사람 모양(작업 중/대기, 다른 방으로 갈 때 복도 경유),
@@ -92,7 +94,6 @@ Factory Replay (2D · 3D 공통)
 - Play / Pause · 속도 ×1 ×2 ×5 ×10 · 타임라인 슬라이더 · 시점 버튼(기본 시점 / 위에서 / 자동 회전).
 - 마우스: 드래그 = 회전, 휠 = 확대/축소, 오른쪽 드래그(또는 Shift + 드래그) = 이동, 올리면 상태 표시. 스페이스바 = 재생/정지.
 - 외부 3D 라이브러리를 쓰지 않아 인터넷 연결 없이 동작하고, 추가로 설치할 패키지도 없음.
-
 
 ## 공정 흐름
 

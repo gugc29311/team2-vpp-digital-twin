@@ -126,15 +126,16 @@ PRINTER_UNATTENDED = True            # 투입은 근무시간에만, 출력은 �
 #   ① 출력→탈거(배치) ② 탈거→세척(세척 로드) ③ 세척→UV(UV 로드) ④ UV→서포트(UV 로드) ⑤ 표면처리→검사(배치)
 # =========================================================
 TRANSPORT_ENABLED = True
-DEFAULT_TRANSPORT_TIME = ("tri", 1, 2, 4, "min")    # ⚠️ 레이아웃 의존
+DEFAULT_TRANSPORT_TIME = ("tri", 1, 2, 4, "min")    # 레이아웃 의존
 
 # 공정(명세서 8.1절) -> 방 이름. 이벤트 로그 location 열에만 쓰임 (좌표·거리·이동시간과 무관)
-# ⚠️ 가정값 — 실제 공장 배치는 인터뷰 확인 필요
+# 가정값 — 실제 공장 배치는 인터뷰 확인 필요
 # 주문은 온라인으로 접수 -> 별도 주문 데스크 없음. 접수·작업 배정·배치 구성은 프린터실에서 처리
 LOCATIONS = {
     "Order Reception": "Print Room",
     "Job Assignment": "Print Room",
     "Batch Formation": "Print Room",
+
     "VPP Build": "Print Room",
     "Part Removal": "Post-processing Room",
     "Washing": "Wash Room",

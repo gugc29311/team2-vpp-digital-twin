@@ -11,12 +11,19 @@ KPI 값이 '그럴듯한지'가 아니라 모델이 '물리적으로 말이 되�
   4. 부품: 한 부품은 한 번만 출력
   5. 설비: 고장·PM·세척액 교체 중에는 그 설비로 작업을 시작하지 않음
   6. 이벤트(keep_events 일 때): 시각이 줄지 않음, 사람 작업 *_START 는 근무시간
+  7. 작업자: 한 사람의 작업 구간이 겹치지 않음 (한 명이 동시에 두 작업 X) [명세서 14절 L3]
+  8. 공정 순서(keep_events 일 때): 출력 종료 ≤ 탈거 시작, 탈거 종료 ≤ 세척 시작, 세척 종료 ≤ UV 시작,
+     UV 종료 ≤ 서포트 제거 시작 ≤ ... ≤ 검사 ≤ 포장 (작업 완료 전에 후공정 시작 X) [명세서 14절 L3]
+  9. 이동(keep_events 일 때): 앞 공정 종료 ≤ 이동 출발, 이동 도착 ≤ 다음 공정·대기열 진입
+     (이동하기 전에 다음 위치 도착 X) [명세서 14절 L3]
 
 사용
   from src.validation.invariants import check
   assert not check(VPPSimulation(cfg).run())
 """
-from collections import Counter
+from collections import Counter, defaultdict
+
+from src.resources.resources import role_of
 
 EPS = 1e-6
 HUMANS = ("job_assignment_workers", "post_process_workers", "quality_inspectors", "packers")
@@ -88,7 +95,7 @@ def check_downtime(res):
     """설비가 고장·PM·세척액 교체 중일 때 그 설비로 작업이 시작되지 않음 (이벤트 로그 필요)."""
     if not res.log.keep_events:
         return []
-    starts = [(e[0], e[4]) for e in res.log.events if e[3] in MACHINE_STARTS]
+    starts = [(e.sim_time, e.resource) for e in res.log.events if e.event in MACHINE_STARTS]
     out = []
     for u in res.units:
         for kind, s, e in u.log:
@@ -102,16 +109,127 @@ def check_events(res):
     if not res.log.keep_events:
         return []
     out, cal = [], res.calendar
-    times = [e[0] for e in res.log.events]
+    times = [e.sim_time for e in res.log.events]
     if any(a > b + EPS for a, b in zip(times, times[1:])):
         out.append("이벤트 시각이 줄어드는 구간 있음")
-    for t, _, eid, ev, r, _ in res.log.events:
-        if ev.endswith("_START") and r in HUMANS and not cal.is_open(t):
-            out.append(f"{eid}: {ev} 가 근무시간 밖 ({t:.4f})")
+    for e in res.log.events:
+        if e.event.endswith("_START") and role_of(e.resource) in HUMANS and not cal.is_open(e.sim_time):
+            out.append(f"{e.entity_id}: {e.event} 가 근무시간 밖 ({e.sim_time:.4f})")
     return out
 
 
-CHECKS = (check_resources, check_batches, check_orders, check_downtime, check_events)
+def check_workers(res):
+    """작업자 개인 구간: 겹침 없음, ID 가 그 역할의 명단에 있음 (person_busy — 이벤트 로그 없이도 동작)."""
+    by = defaultdict(list)
+    for w, role, s, e, _ in res.log.person_busy:
+        by[w].append((s, e, role))
+    out = []
+    for w, iv in by.items():
+        roles = {r for _, _, r in iv}
+        if roles != {role_of(w)} or w not in res.workers.get(role_of(w), []):
+            out.append(f"{w}: 역할·명단 불일치 {sorted(roles)}")
+        iv.sort()
+        for (s1, e1, _), (s2, e2, _) in zip(iv, iv[1:]):
+            if s2 < e1 - EPS:
+                out.append(f"{w}: 작업 겹침 [{s1:.4f}, {e1:.4f}] / [{s2:.4f}, {e2:.4f}]")
+    return out
+
+
+_PART_CHAIN = ("SUPPORT_REMOVAL", "SURFACE_TREATMENT", "INSPECTION", "PACKAGING")
+
+
+def check_process_order(res):
+    """배치·로드·부품의 공정 순서 (이벤트 로그 필요). 아직 일어나지 않은 단계는 건너뜀."""
+    if not res.log.keep_events:
+        return []
+    part_batch = {p.part_id: b.batch_id for b in res.batches for p in b.parts}
+    batch_ev = defaultdict(lambda: defaultdict(list))            # 배치 -> 이벤트 -> [시각] (로드 포함)
+    part_ev = defaultdict(dict)                                  # 부품 -> 이벤트 -> 첫 시각
+    for e in res.log.events:
+        if e.entity_type == "BATCH":
+            batch_ev[e.entity_id][e.event].append(e.sim_time)
+        elif e.entity_type == "LOAD":
+            batch_ev[e.entity_id.split("-")[0]][e.event].append(e.sim_time)
+        elif e.entity_type == "PART":
+            part_ev[e.entity_id].setdefault(e.event, e.sim_time)
+    out = []
+
+    def before(label, a, b):
+        if a is not None and b is not None and a > b + EPS:
+            out.append(f"{label}: {a:.4f} > {b:.4f}")
+
+    last = lambda ev, k: max(ev[k]) if ev.get(k) else None
+    first = lambda ev, k: min(ev[k]) if ev.get(k) else None
+    for bid, ev in batch_ev.items():
+        before(f"{bid} 출력 종료 -> 탈거 시작", last(ev, "VPP_BUILD_END"), first(ev, "PART_REMOVAL_START"))
+        before(f"{bid} 탈거 종료 -> 세척 시작", last(ev, "PART_REMOVAL_END"), first(ev, "WASHING_START"))
+        before(f"{bid} 세척 종료 -> UV 시작", last(ev, "WASHING_END"), first(ev, "UV_CURING_START"))
+    for pid, ev in part_ev.items():
+        bid = part_batch.get(pid)
+        uv_end = last(batch_ev[bid], "UV_CURING_END") if bid in batch_ev else None
+        before(f"{pid} UV 종료 -> 서포트 제거 시작", uv_end, ev.get("SUPPORT_REMOVAL_START"))
+        for a, b in zip(_PART_CHAIN, _PART_CHAIN[1:]):
+            before(f"{pid} {a} 종료 -> {b} 시작", ev.get(a + "_END"), ev.get(b + "_START"))
+    return out
+
+
+def check_transport(res):
+    """
+    이동 순서 (이벤트 로그 필요) [명세서 14절 L3 '이동하기 전에 다음 위치 도착'].
+      - 앞 공정이 끝나기 전에 이동을 출발하지 않음
+      - 이동이 끝나기(도착) 전에 다음 공정·대기열에 들어가지 않음
+    ① 출력 -> 탈거(배치) ② 탈거 -> 세척(세척 로드) ③ 세척 -> UV(UV 로드) ④ UV -> 서포트(UV 로드) ⑤ 표면처리 -> 검사(배치)
+    """
+    if not res.log.keep_events:
+        return []
+    ent = defaultdict(lambda: defaultdict(list))                 # 대상 ID -> 이벤트 -> [시각]
+    loads = defaultdict(set)                                      # 배치 -> 로드 ID
+    for e in res.log.events:
+        ent[e.entity_id][e.event].append(e.sim_time)
+        if e.entity_type == "LOAD":
+            loads[e.entity_id.split("-")[0]].add(e.entity_id)
+    out = []
+
+    def before(label, a, b):
+        if a is not None and b is not None and a > b + EPS:
+            out.append(f"{label}: {a:.4f} > {b:.4f}")
+
+    def times(ids, event, pick):
+        vals = [t for i in ids for t in ent[i].get(event, [])]
+        return pick(vals) if vals else None
+
+    for b in res.batches:
+        bid = b.batch_id
+        wash = sorted(i for i in loads[bid] if "-W" in i)
+        uv = sorted(i for i in loads[bid] if "-U" in i)
+        parts = [p.part_id for p in b.parts]
+        before(f"{bid} 출력 종료 -> 이동① 출발", times([bid], "VPP_BUILD_END", max),
+               times([bid], "TRANSPORT_1_PRINT_TO_REMOVAL_START", min))
+        before(f"{bid} 이동① 도착 -> 탈거 시작", times([bid], "TRANSPORT_1_PRINT_TO_REMOVAL_END", max),
+               times([bid], "PART_REMOVAL_START", min))
+        for w in wash:
+            before(f"{w} 탈거 종료 -> 이동② 출발", times([bid], "PART_REMOVAL_END", max),
+                   times([w], "TRANSPORT_2_TO_WASHING_START", min))
+            before(f"{w} 이동② 도착 -> 세척 대기열", times([w], "TRANSPORT_2_TO_WASHING_END", max),
+                   times([w], "WASHING_QUEUE_ENTER", min))
+        for u in uv:
+            before(f"{u} 세척 종료 -> 이동③ 출발", times(wash, "WASHING_END", max),
+                   times([u], "TRANSPORT_3_TO_UV_START", min))
+            before(f"{u} 이동③ 도착 -> UV 대기열", times([u], "TRANSPORT_3_TO_UV_END", max),
+                   times([u], "UV_CURING_QUEUE_ENTER", min))
+            before(f"{u} UV 종료 -> 이동④ 출발", times(uv, "UV_CURING_END", max),
+                   times([u], "TRANSPORT_4_TO_SUPPORT_START", min))
+        before(f"{bid} 이동④ 도착 -> 서포트 제거 시작", times(uv, "TRANSPORT_4_TO_SUPPORT_END", max),
+               times(parts, "SUPPORT_REMOVAL_START", min))
+        before(f"{bid} 표면처리 종료 -> 이동⑤ 출발", times(parts, "SURFACE_TREATMENT_END", max),
+               times([bid], "TRANSPORT_5_TO_INSPECTION_START", min))
+        before(f"{bid} 이동⑤ 도착 -> 검사 시작", times([bid], "TRANSPORT_5_TO_INSPECTION_END", max),
+               times(parts, "INSPECTION_START", min))
+    return out
+
+
+CHECKS = (check_resources, check_batches, check_orders, check_downtime, check_events, check_workers,
+          check_process_order, check_transport)
 
 
 def check(res):

@@ -1,7 +1,7 @@
 simpy>=4.1,<5
 numpy>=1.24
-pandas
-plotly
-streamlit
+# 대시보드
+streamlit>=1.50
+plotly>=5.18
 # 개발/테스트
 pytest>=7

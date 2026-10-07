@@ -18,15 +18,16 @@ VPP 공정 시뮬레이션 (SimPy).
 실행 (프로젝트 최상위 폴더):  python main.py   |   python -m src.model.simulation
 """
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import simpy
 
 from src.analysis.event_log import EventLog
+from src.analysis.event_schema import order_ids, process_of, state_of
 from src.entities.batch import Batch
 from src.entities.order import make_parts
 from src.model.config import SimConfig
-from src.model.order_source import check_orders_for_config, load_orders, random_order
+from src.model.order_source import check_orders_for_config, estimate_build_time, load_orders, random_order
 from src.resources.resources import FactoryResources
 from src.scheduler import dispatch
 from src.utils.calendar import make_calendar
@@ -45,6 +46,10 @@ class SimulationResult:
     units: list            # 설비 객체 (고장·PM·세척액 교체 기록)
     resin_log: list        # (출력 시작 시각, 레진 mm³, 재출력 여부)
     printed_parts: list    # (출력 시작 시각, 재출력 여부)
+    load_queue: list = field(default_factory=list)   # [설비, 대기 진입, 시작(None=대기 중)] 세척·UV 로드
+    workers: dict = field(default_factory=dict)      # 역할 -> 작업자 개인 ID 목록 (JA1.., PP1.., QI1..)
+    machine_phases: list = field(default_factory=list)  # (설비, 상태 6종, 시작, 끝) — [0, 종료] 를 빈틈없이 덮음
+    worker_queue: list = field(default_factory=list)    # [역할, 요청, 작업 시작(None=대기 중)] 인력 대기
 
 
 class VPPSimulation:
@@ -69,7 +74,11 @@ class VPPSimulation:
         self._n_done = 0
         self.resin_log = []
         self.printed_parts = []
+        self.load_queue = []              # 세척·UV 로드 대기 구간 (keep_events 와 무관하게 기록 -> 대기 KPI)
+        self.machine_phases = []          # 설비 상태 구간 (keep_events 와 무관하게 기록 -> 상태별 시간 KPI)
+        self.worker_queue = []            # 인력 대기 구간 (요청 -> 첫 작업 시작, 근무시간 대기 포함) -> 인력 대기 KPI
         self.all_done = self.env.event()
+        self._ps_cache = {}               # (대상 종류, 이벤트, 공정) -> (공정, 상태) — 주문 Current State 갱신용
 
     # =====================================================
     # 실행
@@ -89,9 +98,12 @@ class VPPSimulation:
             env.process(self._random_source())
             until = cfg.SIMULATION_TIME
         env.run(until=until)
+        for u in self.res.all_units:                  # 진행 중인 상태 구간을 종료 시각에서 닫음
+            self._close_phase(u, env.now)
         caps = {name: self.res.capacity_of(name) for name, _ in FactoryResources.TRACKED}
         return SimulationResult(cfg, self.orders, self.batches, self.log, env.now, self.cal, caps,
-                                self.res.all_units, self.resin_log, self.printed_parts)
+                                self.res.all_units, self.resin_log, self.printed_parts, self.load_queue,
+                                self.res.workers, self.machine_phases, self.worker_queue)
 
     # =====================================================
     # 공통 도구
@@ -100,43 +112,141 @@ class VPPSimulation:
         """분포에서 시간(hour) 추출."""
         return sample(spec, self.rng[stream])
 
-    def _work(self, res_name, tasks, entity_type, entity_id):
+    def _log(self, t, entity_type, entity_id, event, resource="", detail="", ref=None, process=None):
         """
-        인력 1명(또는 자원 1개)을 잡고 tasks=[(작업명, 근무시간 h), ...] 를 순서대로 수행 (한 번의 점유).
-        대기·시작·종료를 로그에 남기고, 가동률 계산용 점유 구간을 작업별로 기록.
+        이벤트 1줄 [명세서 10절 형식]. ref = 관련 주문·부품·배치·부품 목록 (order_id 열),
+        process 생략 시 이벤트 이름으로 결정. 로그를 보관·출력하지 않으면(반복 실험) 계산 자체를 건너뜀.
+        """
+        if ref is not None and entity_type != "MACHINE":
+            key = (entity_type, event, process)
+            ps = self._ps_cache.get(key)
+            if ps is None:
+                ps = self._ps_cache[key] = (process or process_of(event), state_of(entity_type, event))
+            self._update_order_state(ref, *ps)
+            process = ps[0]
+        if not self.log.active:
+            return
+        process = process or process_of(event)
+        self.log.add(t, entity_type, entity_id, event, resource, detail, order_id=order_ids(ref),
+                     process=process, location=self.cfg.LOCATIONS[process], state=state_of(entity_type, event))
+
+    @staticmethod
+    def _update_order_state(ref, process, state):
+        """
+        주문의 Current State 갱신 [명세서 4절]: 그 주문이 가장 최근에 움직인 공정·상태
+        (state_at 의 주문 위치와 같은 규칙 — 부품이 여러 개면 가장 최근에 움직인 부품·배치 기준).
+        로그 보관 여부와 무관하게 갱신 (반복 실험에서도 주문 객체의 상태는 맞게 유지).
+        """
+        if hasattr(ref, "parts"):                                  # Batch
+            ref = ref.parts
+        if isinstance(ref, (list, tuple)):
+            for p in ref:
+                o = p.order
+                o.current_process, o.current_state = process, state
+        else:
+            o = ref.order if hasattr(ref, "order") else ref
+            o.current_process, o.current_state = process, state
+
+    # ---- 장비 상태 6종 [명세서 11절]: Idle / Setup / Running / Waiting / Down / Maintenance
+    def _phase(self, unit, state, detail="", event=None, log=True, t=None):
+        """
+        설비 상태 전환 (t 생략 = 지금). 이전 상태 구간을 닫아 machine_phases 에 기록하고,
+        log 면 이벤트 로그에 전환 이벤트 (기본 이름 <STATE>_START). 기록만 할 뿐 동작·난수에 영향 없음.
+        """
+        t = self.env.now if t is None else t
+        if state == unit.state:
+            return
+        self._close_phase(unit, t)
+        unit.state, unit.state_since = state, t
+        if log:
+            self._log(t, "MACHINE", unit.name, event or f"{state.upper()}_START", unit.name, detail,
+                      process=self._UNIT_PROCESS[unit.kind])
+
+    def _pauses_off_hours(self, unit):
+        """근무시간 외에 멈추는 처리인지 (세척·UV, 무인운전이 아닌 프린터)."""
+        c = self.cfg
+        return c.USE_WORK_CALENDAR and (unit.kind != "printer" or not c.PRINTER_UNATTENDED)
+
+    def _close_phase(self, unit, t):
+        """
+        현재 상태 구간 [state_since, t] 기록. 근무시간 외에 멈추는 설비의 Running·Setup(세척·UV 적재·인출,
+        무인운전이 아닌 프린터)은 멈춘 부분을 Waiting 으로 나눔.
+        """
+        s, state = unit.state_since, unit.state
+        if t <= s + 1e-12:
+            return
+        if state not in ("Running", "Setup") or not self._pauses_off_hours(unit):
+            self.machine_phases.append((unit.name, state, s, t))
+            return
+        cal, cur = self.cal, s
+        while cur < t - 1e-12:
+            if cal.is_open(cur):
+                nxt, st = min(t, cur + cal.left_in_window(cur)), state
+            else:
+                nxt, st = min(t, cur + cal.until_open(cur)), "Waiting"
+            if nxt <= cur:                                      # 부동소수 경계 보호
+                nxt = t
+            self.machine_phases.append((unit.name, st, cur, nxt))
+            cur = nxt
+        unit.state_since = t
+
+    def _log_later(self, delay, unit, event, detail):
+        """delay 뒤 설비 이벤트 1줄 (프린터 셋업 -> 출력 경계). 로그를 켰을 때만 사용 — 자원·난수를 건드리지 않음."""
+        yield self.env.timeout(delay)
+        self._log(self.env.now, "MACHINE", unit.name, event, unit.name, detail, process=self._UNIT_PROCESS[unit.kind])
+
+    def _work(self, res_name, tasks, entity_type, entity_id, ref=None, process=None, on_start=None):
+        """
+        작업자 1명을 잡고 tasks=[(작업명, 근무시간 h), ...] 를 순서대로 수행 (한 번의 점유).
+        대기열(역할 단위, FIFO) -> 빈 사람 배정(개인 ID) -> 작업. 이벤트 resource 열 = 개인 ID.
+        점유 구간은 역할 단위(가동률, busy)와 개인 단위(person_busy) 둘 다 기록.
+        ref / process: 이벤트 로그 order_id · process 열 (_log 참고).
+        on_start: 첫 작업이 실제로 시작되는 순간 호출 (설비 상태 Setup 전환용 — 기록만).
         """
         resource = getattr(self.res, res_name)
         t_req = self.env.now
+        wait_rec = [res_name, t_req, None]
+        self.worker_queue.append(wait_rec)
         with resource.request() as req:
             yield req
-            wait = self.env.now - t_req
-            for i, (task, hours) in enumerate(tasks):
-                yield from self.cal.wait_open(self.env)              # 근무시간이 될 때까지 대기한 뒤 기록
-                start = self.env.now
-                wait = start - t_req if i == 0 else 0.0              # 자원 대기 + 근무시간 대기
-                self.log.add(start, entity_type, entity_id, f"{task}_START", res_name,
-                            f"wait={wait:.2f}h" if wait > 1e-9 else "")
-                yield from self.cal.delay(self.env, hours)
-                self.log.add(self.env.now, entity_type, entity_id, f"{task}_END", res_name)
-                self.log.add_busy(res_name, start, self.env.now, hours)
+            who = self.res.take_worker(res_name)
+            try:
+                for i, (task, hours) in enumerate(tasks):
+                    yield from self.cal.wait_open(self.env)          # 근무시간이 될 때까지 대기한 뒤 기록
+                    start = self.env.now
+                    wait = start - t_req if i == 0 else 0.0          # 자원 대기 + 근무시간 대기
+                    if i == 0:
+                        wait_rec[2] = start
+                    self._log(start, entity_type, entity_id, f"{task}_START", who,
+                              f"wait={wait:.2f}h" if wait > 1e-9 else "", ref, process)
+                    if i == 0 and on_start is not None:
+                        on_start()
+                    yield from self.cal.delay(self.env, hours)
+                    self._log(self.env.now, entity_type, entity_id, f"{task}_END", who, "", ref, process)
+                    self.log.add_busy(res_name, start, self.env.now, hours)
+                    self.log.add_person_busy(who, res_name, start, self.env.now, hours)
+            finally:
+                self.res.release_worker(res_name, who)
 
     def _transport_time(self):
         return self._t(self.cfg.DEFAULT_TRANSPORT_TIME, "transport") if self.cfg.TRANSPORT_ENABLED else 0.0
 
-    def _transport(self, res_name, entity_type, entity_id, segment):
+    def _transport(self, res_name, entity_type, entity_id, segment, ref=None):
         if self.cfg.TRANSPORT_ENABLED:
             yield from self._work(res_name, [(f"TRANSPORT_{segment}", self._transport_time())],
-                                  entity_type, entity_id)
+                                  entity_type, entity_id, ref)
 
-    def _get_unit(self, pool_name):
+    def _get_unit(self, pool_name, for_id=""):
         """
         설비 풀에서 지금 쓸 수 있는 설비 객체를 꺼낸다.
           - 캘린더 사용 시 적재는 근무시간에만 (밤에 반납된 설비라도 근무 시작까지 대기)
           - 꺼낸 설비가 고장·PM 도래면 그 설비는 정비 프로세스로 보내고 다른 설비를 다시 기다림 (비선점)
+        꺼낸 설비는 Waiting (작업에 배정됐지만 근무시간·작업자 대기) — for_id = 배정된 배치·로드 (이벤트 상세).
         """
         pool = self.res.pools[pool_name]
         while True:
             unit = yield pool.get()
+            self._phase(unit, "Waiting", for_id)
             if self.cfg.USE_WORK_CALENDAR:
                 yield from self.cal.wait_open(self.env)
             if self.cfg.BREAKDOWN_ENABLED and unit.due(self.env.now):
@@ -144,16 +254,30 @@ class VPPSimulation:
                 continue
             return unit
 
+    _UNIT_PROCESS = {"printer": "VPP Build", "washing": "Washing", "uv_curing": "UV Curing"}
+
     def _service_and_return(self, unit, pool):
-        self.log.add(self.env.now, "MACHINE", unit.name, "MAINTENANCE_START", unit.name)
-        yield from unit.service(self.env, self.cal, self.cfg.MAINTENANCE_IN_WORK_HOURS_ONLY)
-        self.log.add(self.env.now, "MACHINE", unit.name, "MAINTENANCE_END", unit.name)
+        """고장 수리 = Down (DOWN_START/END), PM = Maintenance (MAINTENANCE_START/END) — EquipmentUnit.log 의 fail/pm."""
+        proc = self._UNIT_PROCESS[unit.kind]
+        names = {"fail": ("Down", "DOWN"), "pm": ("Maintenance", "MAINTENANCE")}
+
+        def on_event(kind, edge):
+            state, name = names[kind]
+            if edge == "start":
+                self._phase(unit, state, event=f"{name}_START")
+            else:
+                self._log(self.env.now, "MACHINE", unit.name, f"{name}_END", unit.name, process=proc)
+
+        yield from unit.service(self.env, self.cal, self.cfg.MAINTENANCE_IN_WORK_HOURS_ONLY, on_event)
+        self._phase(unit, "Idle", log=False)                    # *_END 이벤트가 이미 Idle 을 뜻함
         yield pool.put(unit)
 
     def _clean_and_return(self, unit, pool):
-        self.log.add(self.env.now, "MACHINE", unit.name, "CLEANING_START", unit.name)
+        """세척액 교체 = Maintenance (CLEANING_START/END)."""
+        self._phase(unit, "Maintenance", event="CLEANING_START")
         yield from unit.clean(self.env, self.cal, self._t(self.cfg.CLEANING_LIQUID_CHANGE_TIME))
-        self.log.add(self.env.now, "MACHINE", unit.name, "CLEANING_END", unit.name)
+        self._log(self.env.now, "MACHINE", unit.name, "CLEANING_END", unit.name, process="Washing")
+        self._phase(unit, "Idle", log=False)
         yield pool.put(unit)
 
     # =====================================================
@@ -178,11 +302,12 @@ class VPPSimulation:
 
     def _order_flow(self, o):
         o.received_time = self.env.now
-        self.log.add(self.env.now, "ORDER", o.order_id, "ORDER_RECEIVED", "",
-                     f"qty={o.quantity} material={o.material} due={o.due_date:.2f} priority={o.priority}")
+        o.estimated_build_time = estimate_build_time(o.height_mm, self.cfg)   # 명세서 4절 Estimated Build Time
+        self._log(self.env.now, "ORDER", o.order_id, "ORDER_RECEIVED", "",
+                  f"qty={o.quantity} material={o.material} due={o.due_date:.4f} priority={o.priority}", o)
         if not self.printer_only:     # 프린터 용량 측정 시에는 JA 를 건너뜀 (JA 가 병목이 되어 용량을 과소 측정하지 않도록)
             yield from self._work("job_assignment_workers",
-                                  [("JOB_ASSIGNMENT", self._t(self.cfg.JOB_ASSIGNMENT_TIME))], "ORDER", o.order_id)
+                                  [("JOB_ASSIGNMENT", self._t(self.cfg.JOB_ASSIGNMENT_TIME))], "ORDER", o.order_id, o)
         for p in make_parts(o):
             self._add_to_batch(p)
 
@@ -226,13 +351,13 @@ class VPPSimulation:
                       self.env.now, urgent=urgent)
             self.open_batches[key] = b
             self.batches.append(b)
-            self.log.add(self.env.now, "BATCH", b.batch_id, "BATCH_OPENED", "",
-                         f"material={b.material}" + (" urgent" if urgent else ""))
+            self._log(self.env.now, "BATCH", b.batch_id, "BATCH_OPENED", "",
+                      f"material={b.material}" + (" urgent" if urgent else ""), [part])
             wait = self.cfg.URGENT_BATCH_MAX_WAIT_TIME if urgent else self.cfg.BATCH_MAX_WAIT_TIME
             if wait is not None:
                 self.env.process(self._batch_timer(b, wait))
         b.parts.append(part)
-        self.log.add(self.env.now, "PART", part.part_id, "ADDED_TO_BATCH", "", b.batch_id)
+        self._log(self.env.now, "PART", part.part_id, "ADDED_TO_BATCH", "", b.batch_id, part)
         trig = self._full_trigger(b)
         if trig:
             self._close_batch(b, trig)
@@ -247,19 +372,21 @@ class VPPSimulation:
         for k, v in list(self.open_batches.items()):
             if v is b:
                 del self.open_batches[k]
-        self.log.add(self.env.now, "BATCH", b.batch_id, "BATCH_CLOSED", "",
-                     f"trigger={trigger} parts={b.n_parts} area={b.total_area:.0f}")
+        self._log(self.env.now, "BATCH", b.batch_id, "BATCH_CLOSED", "",
+                  f"trigger={trigger} parts={b.n_parts} area={b.total_area:.0f}", b)
         self.env.process(self._batch_flow(b))
 
     # =====================================================
     # 배치 공정
     # =====================================================
     def _build_time(self, b):
+        """(총 출력시간, 셋업 시간). 난수 추출 순서·합산식은 기존과 같음 (셋업 -> 층당 시간, 셋업 + 층수 x 층당)."""
         c = self.cfg
         if c.VPP_BUILD_TIME_MODE == "fixed":
-            return self._t(c.VPP_BUILD_TIME)
+            return self._t(c.VPP_BUILD_TIME), 0.0
         layers = math.ceil(round(b.max_height / c.LAYER_THICKNESS_MM, 9))
-        return self._t(c.BUILD_SETUP_TIME) + layers * self._t(c.TIME_PER_LAYER)
+        setup = self._t(c.BUILD_SETUP_TIME)
+        return setup + layers * self._t(c.TIME_PER_LAYER), setup
 
     def _priority(self, b):
         return dispatch.priority(self.cfg.DEFAULT_SCHEDULING_RULE, b, self._request_seq)
@@ -268,28 +395,40 @@ class VPPSimulation:
         c, env = self.cfg, self.env
         prep = self._t(c.BUILD_PREPARATION_TIME)
         if prep > 0 and not self.printer_only:
-            yield from self._work("job_assignment_workers", [("BUILD_PREPARATION", prep)], "BATCH", b.batch_id)
+            yield from self._work("job_assignment_workers", [("BUILD_PREPARATION", prep)], "BATCH", b.batch_id, b)
 
         # ---- VPP Build
-        b.build_time = self._build_time(b)
+        b.build_time, b.setup_time = self._build_time(b)
         self._request_seq += 1
         t_req = env.now
-        self.log.add(env.now, "BATCH", b.batch_id, "PRINTER_QUEUE_ENTER", "vpp_printers")
+        self._log(env.now, "BATCH", b.batch_id, "PRINTER_QUEUE_ENTER", "vpp_printers", "", b)
         with self.res.vpp_printers.request(priority=self._priority(b)) as req:
             yield req
-            unit = yield from self._get_unit("vpp_printers")
+            unit = yield from self._get_unit("vpp_printers", b.batch_id)
             b.print_start = env.now
-            self.log.add(env.now, "BATCH", b.batch_id, "VPP_BUILD_START", unit.name,
-                         f"build={b.build_time:.2f}h wait={env.now - t_req:.2f}h")
+            self._log(env.now, "BATCH", b.batch_id, "VPP_BUILD_START", unit.name,
+                      f"build={b.build_time:.2f}h wait={env.now - t_req:.2f}h", b)
+            # 장비 상태: 셋업(Setup) -> 층 출력(Running). 출력 대기는 기존대로 한 번 (총 시간·이벤트 순서 불변),
+            # Setup -> Running 경계는 구간 기록에 넣고, 이벤트 로그에는 기록 전용 프로세스가 남김.
+            attended = c.USE_WORK_CALENDAR and not c.PRINTER_UNATTENDED
+            run_at = self.cal.add_work_hours(env.now, b.setup_time) if attended else env.now + b.setup_time
+            if b.setup_time > 0:
+                self._phase(unit, "Setup", b.batch_id)
+                if self.log.active:
+                    env.process(self._log_later(run_at - env.now, unit, "RUNNING_START", b.batch_id))
+            else:
+                self._phase(unit, "Running", b.batch_id)
             self._record_print(b)
-            if c.USE_WORK_CALENDAR and not c.PRINTER_UNATTENDED:
+            if attended:
                 yield from self.cal.delay(env, b.build_time)
             else:
                 yield env.timeout(b.build_time)
             b.print_end = env.now
             unit.cum_op += b.build_time
+            self._phase(unit, "Running", log=False, t=run_at)
+            self._phase(unit, "Idle", b.batch_id)
             self.res.printer_pool.put(unit)
-            self.log.add(env.now, "BATCH", b.batch_id, "VPP_BUILD_END", unit.name)
+            self._log(env.now, "BATCH", b.batch_id, "VPP_BUILD_END", unit.name, "", b)
             self.log.add_busy("vpp_printers", b.print_start, b.print_end, b.build_time)
         if self.printer_only:
             return
@@ -307,7 +446,7 @@ class VPPSimulation:
         removal = self._t(c.PART_REMOVAL_TIME) + sum(self._t(c.PART_REMOVAL_TIME_PER_PART) for _ in good)
         tasks = ([("TRANSPORT_1_PRINT_TO_REMOVAL", self._transport_time())] if c.TRANSPORT_ENABLED else []) \
             + [("PART_REMOVAL", removal)]
-        yield from self._work("post_process_workers", tasks, "BATCH", b.batch_id)
+        yield from self._work("post_process_workers", tasks, "BATCH", b.batch_id, good)
 
         # ---- 세척 / UV (로드 단위)
         yield from self._machine_stage(b, good, "washing_machines", c.WASHING_LOAD_CAPACITY,
@@ -316,17 +455,22 @@ class VPPSimulation:
                                        c.UV_CURING_TIME, "UV_CURING", "U", "3_TO_UV")
 
         # ---- ④ 이동 + Support Removal + Surface Treatment
-        for k in range(math.ceil(len(good) / c.UV_CURING_LOAD_CAPACITY)):
-            yield from self._transport("post_process_workers", "LOAD", f"{b.batch_id}-U{k + 1}", "4_TO_SUPPORT")
+        cap = c.UV_CURING_LOAD_CAPACITY
+        for k in range(math.ceil(len(good) / cap)):
+            yield from self._transport("post_process_workers", "LOAD", f"{b.batch_id}-U{k + 1}", "4_TO_SUPPORT",
+                                       good[k * cap:(k + 1) * cap])
+        # 주문의 Required Process 에 없는 후공정은 건너뜀 [명세서 4절] (기본값 = 전체 -> 기존과 동일)
         for p in good:
-            yield from self._work("post_process_workers", [("SUPPORT_REMOVAL", self._t(c.SUPPORT_REMOVAL_TIME))],
-                                  "PART", p.part_id)
+            if p.order.needs("Support Removal"):
+                yield from self._work("post_process_workers",
+                                      [("SUPPORT_REMOVAL", self._t(c.SUPPORT_REMOVAL_TIME))], "PART", p.part_id, p)
         for p in good:
-            yield from self._work("post_process_workers",
-                                  [("SURFACE_TREATMENT", self._t(c.SURFACE_TREATMENT_TIME))], "PART", p.part_id)
+            if p.order.needs("Surface Treatment"):
+                yield from self._work("post_process_workers",
+                                      [("SURFACE_TREATMENT", self._t(c.SURFACE_TREATMENT_TIME))], "PART", p.part_id, p)
 
         # ---- ⑤ 이동 + Inspection (+ Packaging)
-        yield from self._transport("quality_inspectors", "BATCH", b.batch_id, "5_TO_INSPECTION")
+        yield from self._transport("quality_inspectors", "BATCH", b.batch_id, "5_TO_INSPECTION", good)
         for p in good:
             yield from self._inspect(p)
 
@@ -354,55 +498,73 @@ class VPPSimulation:
         """
         c = self.cfg
         load_id = f"{b.batch_id}-{tag}{k + 1}"
-        yield from self._transport("post_process_workers", "LOAD", load_id, segment)
+        yield from self._transport("post_process_workers", "LOAD", load_id, segment, load)
         handling = self._t(c.LOAD_HANDLING_TIME)
         proc = self._t(time_spec)
         pool = self.res.pools[machine]
-        self.log.add(self.env.now, "LOAD", load_id, f"{task}_QUEUE_ENTER", machine)
+        process = process_of(task)                                    # Washing / UV Curing (적재·인출도 이 공정)
+        self._log(self.env.now, "LOAD", load_id, f"{task}_QUEUE_ENTER", machine, "", load)
+        wait_rec = [machine, self.env.now, None]
+        self.load_queue.append(wait_rec)
         with getattr(self.res, machine).request() as req:
             yield req
-            unit = yield from self._get_unit(machine)
+            unit = yield from self._get_unit(machine, load_id)            # 설비 상태 Waiting
             start = self.env.now
-            self.log.add(start, "LOAD", load_id, f"{task}_START", unit.name,
-                         "parts=" + ",".join(p.part_id for p in load))
+            wait_rec[2] = start
+            self._log(start, "LOAD", load_id, f"{task}_START", unit.name,
+                      "parts=" + ",".join(p.part_id for p in load) if self.log.active else "", load)
+            setup = lambda: self._phase(unit, "Setup", load_id)          # 적재·인출 작업이 실제로 시작될 때
             if handling > 0:
-                yield from self._work("post_process_workers", [("LOADING", handling / 2)], "LOAD", load_id)
+                yield from self._work("post_process_workers", [("LOADING", handling / 2)], "LOAD", load_id,
+                                      load, process, on_start=setup)
+            self._phase(unit, "Running", load_id)                        # 근무시간 외 멈춤은 구간 기록에서 Waiting
             yield from self.cal.delay(self.env, proc)
             unit.cum_op += proc
             if handling > 0:
-                yield from self._work("post_process_workers", [("UNLOADING", handling / 2)], "LOAD", load_id)
-            self.log.add(self.env.now, "LOAD", load_id, f"{task}_END", unit.name)
+                self._phase(unit, "Waiting", load_id)                    # 인출 작업자·근무시간 대기
+                yield from self._work("post_process_workers", [("UNLOADING", handling / 2)], "LOAD", load_id,
+                                      load, process, on_start=setup)
+            self._log(self.env.now, "LOAD", load_id, f"{task}_END", unit.name, "", load)
             self.log.add_busy(machine, start, self.env.now, self.cal.work_hours(start, self.env.now))
             unit.loads += 1
             n = c.CLEANING_LIQUID_CHANGE_EVERY_LOADS
             if machine == "washing_machines" and n and unit.loads % n == 0:
                 self.env.process(self._clean_and_return(unit, pool))
             else:
+                self._phase(unit, "Idle", load_id)
                 pool.put(unit)
 
     def _inspect(self, p):
         c, env = self.cfg, self.env
         t_req = env.now
+        wait_rec = ["quality_inspectors", t_req, None]
+        self.worker_queue.append(wait_rec)
         with self.res.quality_inspectors.request() as req:
             yield req
-            yield from self.cal.wait_open(env)                   # 근무시간이 될 때까지 대기한 뒤 기록
-            start = env.now
-            self.log.add(start, "PART", p.part_id, "INSPECTION_START", "quality_inspectors",
-                         f"wait={start - t_req:.2f}h" if start - t_req > 1e-9 else "")
-            d = self._t(c.INSPECTION_TIME)
-            yield from self.cal.delay(env, d)
-            defect = c.INSPECTION_FAILURE_RATE > 0 and self.rng["quality"].random() < c.INSPECTION_FAILURE_RATE
-            self.log.add(env.now, "PART", p.part_id, "INSPECTION_END", "quality_inspectors",
-                         "FAIL" if defect else "PASS")
-            self.log.add_busy("quality_inspectors", start, env.now, d)
-            if not defect and self.res.packers is None:
-                yield from self.cal.wait_open(env)
-                ps = env.now
-                self.log.add(ps, "PART", p.part_id, "PACKAGING_START", "quality_inspectors")
-                d = self._t(c.PACKAGING_TIME)
+            who = self.res.take_worker("quality_inspectors")
+            try:
+                yield from self.cal.wait_open(env)               # 근무시간이 될 때까지 대기한 뒤 기록
+                start = env.now
+                wait_rec[2] = start
+                self._log(start, "PART", p.part_id, "INSPECTION_START", who,
+                          f"wait={start - t_req:.2f}h" if start - t_req > 1e-9 else "", p)
+                d = self._t(c.INSPECTION_TIME)
                 yield from self.cal.delay(env, d)
-                self.log.add(env.now, "PART", p.part_id, "PACKAGING_END", "quality_inspectors")
-                self.log.add_busy("quality_inspectors", ps, env.now, d)
+                defect = c.INSPECTION_FAILURE_RATE > 0 and self.rng["quality"].random() < c.INSPECTION_FAILURE_RATE
+                self._log(env.now, "PART", p.part_id, "INSPECTION_END", who, "FAIL" if defect else "PASS", p)
+                self.log.add_busy("quality_inspectors", start, env.now, d)
+                self.log.add_person_busy(who, "quality_inspectors", start, env.now, d)
+                if not defect and self.res.packers is None:
+                    yield from self.cal.wait_open(env)
+                    ps = env.now
+                    self._log(ps, "PART", p.part_id, "PACKAGING_START", who, "", p)
+                    d = self._t(c.PACKAGING_TIME)
+                    yield from self.cal.delay(env, d)
+                    self._log(env.now, "PART", p.part_id, "PACKAGING_END", who, "", p)
+                    self.log.add_busy("quality_inspectors", ps, env.now, d)
+                    self.log.add_person_busy(who, "quality_inspectors", ps, env.now, d)
+            finally:
+                self.res.release_worker("quality_inspectors", who)
         if defect:
             self._reject(p, "INSPECTION_FAILED")
         elif self.res.packers is not None:
@@ -411,7 +573,7 @@ class VPPSimulation:
             self._part_done(p)
 
     def _pack(self, p):
-        yield from self._work("packers", [("PACKAGING", self._t(self.cfg.PACKAGING_TIME))], "PART", p.part_id)
+        yield from self._work("packers", [("PACKAGING", self._t(self.cfg.PACKAGING_TIME))], "PART", p.part_id, p)
         self._part_done(p)
 
     # =====================================================
@@ -422,7 +584,8 @@ class VPPSimulation:
         실패/불량 부품: REWORK_ENABLED 면 재출력(Job Assignment 부터), 아니면 폐기.
         재출력 형상: REWORK_SAME_GEOMETRY True = 같은 부품, False = 분포에서 새로 추출(기존 검증 방식).
         """
-        self.log.add(self.env.now, "PART", p.part_id, reason)
+        process = process_of(reason)                                  # VPP Build (출력 실패) / Inspection (검사 불량)
+        self._log(self.env.now, "PART", p.part_id, reason, "", "", p)
         if self.cfg.REWORK_ENABLED:
             p.order.reworks += 1
             if self.cfg.REWORK_SAME_GEOMETRY:
@@ -433,23 +596,24 @@ class VPPSimulation:
             self.env.process(self._rework(p.reprint(area, height)))
         else:
             p.order.parts_scrapped += 1
-            self.log.add(self.env.now, "PART", p.part_id, "SCRAPPED")
-            self._check_order(p.order)
+            self._log(self.env.now, "PART", p.part_id, "SCRAPPED", "", "", p, process)
+            self._check_order(p.order, process)
 
     def _rework(self, q):
         yield from self._work("job_assignment_workers",
-                              [("JOB_ASSIGNMENT_REWORK", self._t(self.cfg.JOB_ASSIGNMENT_TIME))], "PART", q.part_id)
+                              [("JOB_ASSIGNMENT_REWORK", self._t(self.cfg.JOB_ASSIGNMENT_TIME))], "PART", q.part_id, q)
         self._add_to_batch(q)
 
     def _part_done(self, p):
         p.order.parts_good += 1
-        self.log.add(self.env.now, "PART", p.part_id, "PART_COMPLETED")
-        self._check_order(p.order)
+        self._log(self.env.now, "PART", p.part_id, "PART_COMPLETED", "", "", p)
+        self._check_order(p.order, "Packaging")
 
-    def _check_order(self, o):
+    def _check_order(self, o, process):
+        """process = 주문을 끝낸 마지막 공정 (포장 완료 또는 폐기가 일어난 공정)."""
         if o.is_done and o.completed_time is None:
             o.completed_time = self.env.now
-            self.log.add(self.env.now, "ORDER", o.order_id, "ORDER_COMPLETED", "", o.status)
+            self._log(self.env.now, "ORDER", o.order_id, "ORDER_COMPLETED", "", o.status, o, process)
             self._n_done += 1
             if self.cfg.ORDER_SOURCE == "csv" and self._n_done == len(self.orders) \
                     and not self.all_done.triggered:

@@ -7,11 +7,14 @@
 
 CSV 필수 열: order_id, product_id, arrival_time, quantity, material, due_date, priority
 CSV 선택 열: area_mm2, height_mm  (면적 기준 배치 / height 출력시간 모드에서는 필수)
+             required_process   (필요한 후공정, ';' 로 구분. 비우거나 ALL = 전체 후공정) [명세서 4절]
+  estimate_build_time(height_mm, cfg) : 주문 부품 1개의 예상 출력시간 [h] (Estimated Build Time, 명세서 4절)
 """
 import csv
+import math
 
 from src.entities.order import Order
-from src.utils.random_utils import sample
+from src.utils.random_utils import mean, sample
 
 REQUIRED = ("order_id", "product_id", "arrival_time", "quantity", "material", "due_date", "priority")
 
@@ -42,6 +45,7 @@ def load_orders(file_path):
                     priority=row["priority"] or "NORMAL",
                     area_mm2=_opt_float(row, "area_mm2"),
                     height_mm=_opt_float(row, "height_mm"),
+                    required_process=(row.get("required_process") or "").strip() or None,
                 )
             except (ValueError, TypeError) as e:
                 raise ValueError(f"{file_path} {line_no}행: {e}") from None
@@ -50,6 +54,21 @@ def load_orders(file_path):
             seen.add(order.order_id)
             orders.append(order)
     return sorted(orders, key=lambda o: o.arrival_time)
+
+
+def estimate_build_time(height_mm, cfg):
+    """
+    예상 출력시간 [h] = 부품 1개를 단독 출력한다고 볼 때 (명세서 4절 Estimated Build Time).
+      height 모드: 셋업 평균 + ceil(높이 / 층 두께) x 층당 시간 평균  (simulation._build_time 과 같은 식, 난수 없음)
+      fixed 모드 : VPP_BUILD_TIME 평균
+    실제 출력시간은 같은 배치의 최대 높이로 정해지므로 이 값 이상이 된다.
+    """
+    if cfg.VPP_BUILD_TIME_MODE == "fixed":
+        return mean(cfg.VPP_BUILD_TIME)
+    if height_mm is None:
+        return None
+    layers = math.ceil(round(height_mm / cfg.LAYER_THICKNESS_MM, 9))
+    return mean(cfg.BUILD_SETUP_TIME) + layers * mean(cfg.TIME_PER_LAYER)
 
 
 def check_orders_for_config(orders, cfg):

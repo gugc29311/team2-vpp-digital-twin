@@ -14,7 +14,7 @@ CSV = "data/sample_orders.csv"
 
 
 def events_of(res, entity_id):
-    return [e[3] for e in res.log.events if e[2] == entity_id]
+    return [e.event for e in res.log.events if e.entity_id == entity_id]
 
 
 # ---------------------------------------------------------------- 기본 통과
@@ -160,7 +160,8 @@ def test_breakdown_units_not_used_while_down(logic_cfg):
     for prefix in ("P", "WASH", "UV"):                                      # 설비 종류마다 고장 실제 발생
         assert any(k == "fail" for u in res.units if u.name.startswith(prefix) for k, _, _ in u.log), prefix
     # 다운 구간 동안 그 설비로 시작된 작업이 없어야 함
-    starts = [(e[0], e[4]) for e in res.log.events if e[3] in ("VPP_BUILD_START", "WASHING_START", "UV_CURING_START")]
+    starts = [(e.sim_time, e.resource) for e in res.log.events
+              if e.event in ("VPP_BUILD_START", "WASHING_START", "UV_CURING_START")]
     for u in res.units:
         for _, s, e in u.log:
             assert not any(name == u.name and s <= t < e for t, name in starts), u.name

@@ -9,6 +9,7 @@ VPP Digital Twin 실행 진입점. 반드시 프로젝트 최상위 폴더에서
   python main.py --mode random --reps 30           # 30회 독립 반복 + 95% CI (병렬)
   python main.py --mode random --weeks 2 --keep-events   # 2주만 실행 + 이벤트 로그 저장 (OME 조회·Replay용)
   python main.py --preset "Rush Order" --reps 30   # 실험 프리셋 (src/experiments/scenarios.py, random 모드)
+  python main.py --quiet --at "Day 2 10:00"        # 시각 조회 (OME Time Query): 그 시각의 주문·설비·작업자·대기열
 """
 import argparse
 import csv
@@ -16,6 +17,7 @@ import os
 
 from src.analysis.kpi import print_summary, save_outputs
 from src.experiments.scenarios import PRESETS, apply_preset
+from src.logger.state import format_time, order_trace, parse_time, print_state, print_trace, state_at
 from src.model.config import SimConfig
 from src.model.simulation import VPPSimulation
 
@@ -24,7 +26,10 @@ KEY_KPIS = ["printer_rho", "util_job_assignment_workers", "util_post_process_wor
             "lead_work_h_mean", "lead_work_h_p95", "lead_calendar_h_mean", "lead_work_rework_h_mean",
             "on_time_normal", "on_time_urgent", "rework_share_printed", "resin_L_per_week",
             "printer_failures_per_unit", "washing_liquid_changes_per_week","throughput_per_week", "wip_mean", 
-            "printer_queue_mean", "printer_wait_h_mean", "tardiness_work_h_mean"]
+            "printer_queue_mean", "printer_wait_h_mean", "tardiness_work_h_mean",
+            "washing_queue_mean", "washing_wait_h_mean", "uv_queue_mean", "uv_wait_h_mean",
+            "job_assignment_workers_wait_h_mean", "post_process_workers_wait_h_mean",
+            "quality_inspectors_wait_h_mean"]
 
 
 def main():
@@ -40,6 +45,8 @@ def main():
     ap.add_argument("--out", default="outputs", help="결과 CSV 저장 폴더")
     ap.add_argument("--keep-events", action="store_true", help="random 모드에서도 이벤트 로그 보관·저장")
     ap.add_argument("--weeks", type=int, help="random 모드 측정 기간(주), 지정 시 워밍업 0 (KPI는 초기 상태 포함)")
+    ap.add_argument("--at", help='시각 조회 "Day 3 14:25" (Day 1 = 월요일 09:00 시작). csv 모드 또는 --keep-events 필요')
+    ap.add_argument("--trace", help="주문 1건 전체 이벤트 추적 (예: O001). csv 모드 또는 --keep-events 필요")
     args = ap.parse_args()
     if args.preset and args.mode == "csv":
         ap.error("--preset 는 random 모드 전용")
@@ -52,6 +59,18 @@ def main():
         ap.error("--jobs 는 --reps 와 함께 사용")
     if args.weeks is not None and base_mode != "random":
         ap.error("--weeks 는 random 모드에서만 사용")
+    for opt in ("at", "trace"):
+        if getattr(args, opt) is not None:
+            if args.reps:
+                ap.error(f"--{opt} 은 단일 실행에서만 사용 (--reps 와 함께 쓰지 않음)")
+            if base_mode != "csv" and not args.keep_events:
+                ap.error(f"--{opt} 은 이벤트 로그가 필요: csv 모드 또는 --keep-events")
+    at = None
+    if args.at is not None:
+        try:
+            at = parse_time(args.at)
+        except ValueError as e:
+            ap.error(str(e))
 
     overrides = {}
     if args.mode:
@@ -92,6 +111,13 @@ def main():
                         keep_events=(cfg.ORDER_SOURCE == "csv" or args.keep_events)).run()
     print_summary(res)
     print(f"결과 저장: {save_outputs(res, args.out, daily=cfg.ORDER_SOURCE == 'random')}/")
+    if at is not None:
+        if at > res.end_time:
+            print(f"주의: 조회 시각 {format_time(at)} 이 시뮬레이션 종료({format_time(res.end_time)}) 이후 — 종료 시점 상태")
+        print_state(state_at(res, at))
+    if args.trace:
+        print(f"[주문 추적] {args.trace}")
+        print_trace(order_trace(res, args.trace))
 
 
 if __name__ == "__main__":

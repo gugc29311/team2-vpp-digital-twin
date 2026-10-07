@@ -21,6 +21,7 @@ class Batch:
     trigger: Optional[str] = None        # "PARTS" | "AREA" | "OVERFLOW" | "TIME"
     closed_time: Optional[float] = None
     build_time: Optional[float] = None
+    setup_time: float = 0.0              # build_time 중 셋업 부분 (height 모드 BUILD_SETUP_TIME, fixed 모드 0)
     print_start: Optional[float] = None
     print_end: Optional[float] = None
     urgent: bool = False                 # 긴급 전용 배치 (URGENT_BATCH_MAX_WAIT_TIME 사용 시)

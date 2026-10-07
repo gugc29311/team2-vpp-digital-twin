@@ -44,6 +44,19 @@ def _step_stats(series, t0, t1):
     area += w * (t1 - last_t)
     return area / (t1 - t0), peak
 
+LOAD_MACHINES = (("washing_machines", "washing"), ("uv_curing_machines", "uv"))
+
+
+def _load_queue_series(res, machine):
+    """세척·UV 로드 대기열 길이 계단함수 (SimulationResult.load_queue 기반 — keep_events=False 에서도 동작)."""
+    return _level_series([(e, s) for m, e, s in res.load_queue if m == machine])
+
+
+def _worker_queue_series(res, role):
+    """역할별 인력 대기 수 계단함수 (SimulationResult.worker_queue 기반 — keep_events=False 에서도 동작)."""
+    return _level_series([(e, s) for r, e, s in res.worker_queue if r == role])
+
+
 def measure_start(res):
     """측정 시작 시각: random 모드 = WARMUP_TIME, csv 모드 = 0 (검증용 CSV 는 워밍업 없이 전체 집계)."""
     return res.cfg.WARMUP_TIME if res.cfg.ORDER_SOURCE == "random" else 0.0
@@ -63,13 +76,16 @@ def order_table(res):
             continue
         done = o.completed_time is not None
         rows.append({
-            "order_id": o.order_id, "priority": o.priority, "material": o.material, "quantity": o.quantity,
+            "order_id": o.order_id, "product_id": o.product_id, "priority": o.priority, "material": o.material,
+            "quantity": o.quantity, "required_process": ";".join(o.required_process),
+            "estimated_build_time_h": "" if o.estimated_build_time is None else round(o.estimated_build_time, 4),
             "arrival_time": round(o.arrival_time, 4), "due_date": round(o.due_date, 4),
             "completed_time": round(o.completed_time, 4) if done else "",
             "lead_time_h": round(o.completed_time - o.arrival_time, 4) if done else "",
             "lead_time_work_h": round(cal.work_hours(o.arrival_time, o.completed_time), 4) if done else "",
             "on_time": (o.completed_time <= o.due_date + 1e-9) if done else "",
             "reworks": o.reworks, "status": o.status,
+            "current_process": o.current_process, "current_state": o.current_state,
             "parts_good": o.parts_good, "parts_scrapped": o.parts_scrapped,
         })
     return rows
@@ -110,6 +126,30 @@ def utilization(res):
     return out
 
 
+def worker_utilization(res):
+    """작업자 개인별 가동률 = 개인 점유 근무시간 / 측정 구간 근무시간 [명세서 1·10절]. 역할 평균 = 역할 가동률."""
+    cal, t0, t1 = res.calendar, measure_start(res), res.end_time
+    avail = cal.work_hours(t0, t1)
+    busy = {w: 0.0 for ids in res.workers.values() for w in ids}
+    for w, _, s, e, _ in res.log.person_busy:
+        if e > t0 and s < t1:
+            busy[w] += cal.work_hours(max(s, t0), min(e, t1))
+    return {w: (b / avail if avail > 0 else 0.0) for w, b in busy.items()}
+
+
+MACHINE_STATES = ("Idle", "Setup", "Running", "Waiting", "Down", "Maintenance")
+
+
+def machine_state_hours(res):
+    """설비별·상태별 누적 달력시간 [h] (측정 구간) [명세서 11절]. 설비마다 6개 상태 합 = 측정 구간 길이."""
+    t0, t1 = measure_start(res), res.end_time
+    out = {u.name: dict.fromkeys(MACHINE_STATES, 0.0) for u in res.units}
+    for name, state, s, e in res.machine_phases:
+        if e > t0 and s < t1:
+            out[name][state] += min(e, t1) - max(s, t0)
+    return out
+
+
 def _downtime(res, prefix):
     """설비 종류별 측정 구간 고장·PM·세척액 교체 횟수와 다운 시간."""
     t0, t1 = measure_start(res), res.end_time
@@ -133,6 +173,7 @@ def kpis(res):
     u = utilization(res)
     nan = float("nan")
     k = {f"util_{name}": v["utilization"] for name, v in u.items()}
+    k.update({f"util_worker_{w}": v for w, v in worker_utilization(res).items()})
 
     # 프린터: 주당 출력시간, 부하율 ρ (정의 B = 주당 출력시간 / 유효 처리용량)
     pbusy = sum(max(0.0, min(e, t1) - max(s, t0)) for r, s, e, _ in res.log.busy if r == "vpp_printers")
@@ -194,6 +235,20 @@ def kpis(res):
     k["printer_wait_h_mean"] = float(np.mean(pw)) if pw else nan
     k["printer_wait_h_p95"] = float(np.percentile(pw, 95)) if pw else nan
 
+    # 세척·UV 로드 대기 (QUEUE_ENTER -> START: 설비 대기 + 근무시간 대기 + 정비 대기) [명세서 11·12절]
+    for machine, name in LOAD_MACHINES:
+        k[f"{name}_queue_mean"], k[f"{name}_queue_max"] = _step_stats(_load_queue_series(res, machine), t0, t1)
+        lw = [s - e for m, e, s in res.load_queue if m == machine and e >= t0 and s is not None]
+        k[f"{name}_wait_h_mean"] = float(np.mean(lw)) if lw else nan
+        k[f"{name}_wait_h_p95"] = float(np.percentile(lw, 95)) if lw else nan
+
+    # 인력 대기 (요청 -> 첫 작업 시작: 작업자 대기 + 근무시간 대기) [명세서 12절 Average Waiting Time·Queue Length]
+    for role in res.workers:
+        k[f"{role}_queue_mean"], k[f"{role}_queue_max"] = _step_stats(_worker_queue_series(res, role), t0, t1)
+        ww = [s - e for r, e, s in res.worker_queue if r == role and e >= t0 and s is not None]
+        k[f"{role}_wait_h_mean"] = float(np.mean(ww)) if ww else nan
+        k[f"{role}_wait_h_p95"] = float(np.percentile(ww, 95)) if ww else nan
+
     # 재출력 · 레진
     pp = [rw for t, rw in res.printed_parts if t0 <= t < t1]
     k["rework_share_printed"] = float(np.mean(pp)) if pp else nan
@@ -209,6 +264,11 @@ def kpis(res):
         k[f"{name}_down_h_per_week"] = d["down_h"] / weeks if weeks else nan
         if name == "washing":
             k["washing_liquid_changes_per_week"] = d["clean"] / weeks if weeks else nan
+
+    # 설비별·상태별 시간 [h/주] (P1_running_h_per_week ...)
+    for unit, hours in machine_state_hours(res).items():
+        for state, h in hours.items():
+            k[f"{unit}_{state.lower()}_h_per_week"] = h / weeks if weeks else nan
     return k
 
 def bottleneck(res):
@@ -258,6 +318,9 @@ def print_summary(res, show_batches=None):
     for name, u in utilization(res).items():
         print(f"{name:<24} {u['capacity']:>4} {u['busy_h']:>10.1f} {u['available_h']:>10.1f} "
               f"{u['utilization']:>7.1%} {zone(u['utilization'])}")
+    wu = worker_utilization(res)
+    if wu:
+        print("작업자별 가동률: " + " ".join(f"{w} {v:.1%}" for w, v in wu.items()))
     if res.cfg.BREAKDOWN_ENABLED:
         print(f"고장/PM(대당): 프린터 {k['printer_failures_per_unit']:.0f}/{k['printer_pm_per_unit']:.0f}회, "
               f"세척 {k['washing_failures_per_unit']:.0f}/{k['washing_pm_per_unit']:.0f}회, "
@@ -266,10 +329,11 @@ def print_summary(res, show_batches=None):
 
 
 def daily_table(res, day_h=24.0):
-    """달력 1일 단위 시계열: 처리량, 지연 완료 수, WIP, 프린터 대기열, 프린터 가동률."""
+    """달력 1일 단위 시계열: 처리량, 지연 완료 수, WIP, 프린터·세척·UV 대기열, 프린터 가동률."""
     t0, t1 = measure_start(res), res.end_time
     wip = _level_series([(o.arrival_time, o.completed_time) for o in res.orders])
     que = _level_series([(b.closed_time, b.print_start) for b in res.batches if b.closed_time is not None])
+    load_q = {name: _load_queue_series(res, machine) for machine, name in LOAD_MACHINES}
     pr = [(s, e) for r, s, e, _ in res.log.busy if r == "vpp_printers"]
     cap = res.capacities.get("vpp_printers", 0)
     rows, a = [], t0
@@ -285,6 +349,7 @@ def daily_table(res, day_h=24.0):
             "late_completed": sum(o.completed_time > o.due_date + 1e-9 for o in finished),
             "wip_mean": round(_step_stats(wip, a, b)[0], 3),
             "printer_queue_mean": round(_step_stats(que, a, b)[0], 3),
+            **{f"{name}_queue_mean": round(_step_stats(s, a, b)[0], 3) for name, s in load_q.items()},
             "printer_util": round(busy / (cap * (b - a)), 4) if cap else "",
         })
         a = b

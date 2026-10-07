@@ -15,6 +15,7 @@ import copy
 from dataclasses import dataclass, field
 
 import config.parameters as P
+from src.analysis.event_schema import PROCESSES
 from src.scheduler.dispatch import RULES
 from src.utils.random_utils import parse as parse_dist
 
@@ -84,7 +85,9 @@ class SimConfig:
         v = self.values
         for k, val in v.items():
             _check_dists(k, val)
-        for k in ("VPP_PRINTER_COUNT", "WASHING_MACHINE_COUNT", "UV_CURING_MACHINE_COUNT",
+        if int(v["VPP_PRINTER_COUNT"]) < 0:                # 프린터 0대 허용 (Level 5 극한 조건: 생산량 0)
+            raise ValueError(f"VPP_PRINTER_COUNT 는 0 이상이어야 함 (현재 {v['VPP_PRINTER_COUNT']})")
+        for k in ("WASHING_MACHINE_COUNT", "UV_CURING_MACHINE_COUNT",
                   "JOB_ASSIGNMENT_WORKER_COUNT", "POST_PROCESS_WORKER_COUNT", "QUALITY_INSPECTOR_COUNT",
                   "WASHING_LOAD_CAPACITY", "UV_CURING_LOAD_CAPACITY"):
             if int(v[k]) < 1:
@@ -107,6 +110,9 @@ class SimConfig:
                 raise ValueError(f"{k}: 분포 정의 필요 (현재 {v[k]!r}) — random 모드/재출력 새 추출에서 사용")
         if v["ORDER_ARRIVAL_RATE_PER_WEEK"] is None and v["SCENARIO"] not in v["SCENARIO_ARRIVAL_RATES"]:
             raise ValueError(f"SCENARIO '{v['SCENARIO']}' 가 SCENARIO_ARRIVAL_RATES 에 없음")
+        missing = [p for p in PROCESSES if p not in v["LOCATIONS"]]
+        if missing:
+            raise ValueError(f"LOCATIONS 에 공정 위치가 없음: {missing}")
         if v["DEFAULT_SCHEDULING_RULE"] not in _VALID_RULES:
             raise ValueError(f"DEFAULT_SCHEDULING_RULE 는 {sorted(_VALID_RULES)} 중 하나")
         if v["VPP_BUILD_TIME_MODE"] not in ("fixed", "height"):

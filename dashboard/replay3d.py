@@ -7,15 +7,25 @@
     주문 = 방 안의 작은 상자 (작업 중 · 대기), 방 위에 주문 수와 설비 대기열
   - 전체 기간 연속 재생: Play / Pause / 속도 ×1 ×2 ×5 ×10 / 타임라인 슬라이더 (날짜 눈금)
   - 마우스: 드래그 = 회전, 휠 = 확대/축소, 오른쪽 드래그(또는 Shift+드래그) = 이동, 올리면 상태 표시
+  - 실시간 모드(tracks 전달): 작업자·AMR·설비를 이벤트 시각 그대로 그림. 작업자는 작업 위치(방 안) <-> 문 앞(복도)
+    <-> 다른 방으로 걷고(빈손 / 짐), AMR 은 복도에서만 문 앞 선반 사이를 오감 (적재·하역 동안 정지).
+    문 앞 선반에 놓인 운반물 수도 표시. 이동 이벤트 없이 위치가 바뀌면 '순간이동' 으로 빨갛게 표시 (distance 모드면 0건)
+  - 실물 없는 주문(접수·작업 배정·배치 구성·출력 대기)은 방에 두지 않고 왼쪽 위 '실물 없음(전산)' 에 숫자로
   외부 라이브러리 없이 Canvas 로 직접 그림 (인터넷 연결 없이 동작).
 """
 import json
 
-from dashboard.data import ROOM_LABELS, ROOM_LAYOUT
+from dashboard.data import ROOM_LABELS, ROOM_LAYOUT, VIRTUAL_GROUPS
+from src.analysis.event_schema import MACHINE_STATES
+from src.logger.state import DAY_NAMES
 from dashboard.replay import (MAX_IDS, QUEUE_TEXT, STATE_COLORS, STATE_LABELS, _machine_positions,
                               _queue_key, _worker_positions)
 
-_STATES = list(STATE_COLORS)
+# 상태 번호 = MACHINE_STATES 순서 (0 Idle, 1 Setup, 2 Running …). data.replay_tracks 의 상태 구간도 같은 번호를 씀
+# (예전에 STATE_COLORS 순서를 써서 실시간 모드에서 Running <-> Idle 이 뒤바뀌던 버그 수정)
+_STATES = list(MACHINE_STATES)
+ROOM_SHORT = {"Print Room": "프린터실", "Post-processing Room": "후공정실", "Corridor": "복도", "Packing Room": "포장실",
+              "Inspection Room": "검사실", "UV Room": "UV실", "Wash Room": "세척실"}
 
 
 def _kind(unit):
@@ -26,8 +36,15 @@ def _kind(unit):
     return "printer"
 
 
-def build_payload(states, frame_ms=400):
-    """시각별 상태 목록 -> 3D 화면용 JSON 직렬화 가능한 dict (정적 배치 + 프레임별 변화)."""
+DEFAULT_SPEEDS = ((1, "×1"), (2, "×2"), (5, "×5"), (10, "×10"))
+# 실시간 모드: 프레임 1장 = 1분 = 60초 동안 보여줌 -> ×1 = 현실 시간 그대로
+REALTIME_SPEEDS = ((1, "실시간 ×1"), (10, "×10"), (60, "×60 (1초=1분)"), (600, "×600 (1초=10분)"))
+
+
+def build_payload(states, frame_ms=400, speeds=DEFAULT_SPEEDS, tracks=None):
+    """시각별 상태 목록 -> 3D 화면용 JSON 직렬화 가능한 dict (정적 배치 + 프레임별 변화).
+
+    tracks = data.replay_tracks(...) 이면 실시간 모드: 작업자·설비를 프레임이 아니라 이벤트 시각으로 그리고 초 단위 시계."""
     mpos = _machine_positions(states[0]["machines"])
     units = list(states[0]["machines"])
     rooms = list(ROOM_LAYOUT)
@@ -51,7 +68,7 @@ def build_payload(states, frame_ms=400):
             r = s["rooms"][room]
             n = r["waiting"] + r["processing"]
             if room == "Corridor":
-                text = f"이동 대기 주문 {n}"
+                text = f"운반 중 주문 {n}"
             else:
                 text = f"주문 {n} (작업 {r['processing']} · 대기 {r['waiting']})"
                 if room in qtext:
@@ -71,6 +88,9 @@ def build_payload(states, frame_ms=400):
                           if info["room"] in rooms else rooms.index("Corridor"), info["task"] or ""])
 
         frames.append({
+            "t": round(s["t"], 6),
+            "v": [s.get("virtual", {}).get(g, 0) for g in VIRTUAL_GROUPS],
+            "sh": [s["rooms"][r].get("shelf", 0) for r in rooms],
             "l": s["label"],
             "k": [s["wip"], s["completed"], s["late"], round(s["resin_L"], 1)],
             "m": [_STATES.index(s["machines"][u]["state"]) for u in units],
@@ -80,8 +100,13 @@ def build_payload(states, frame_ms=400):
 
     return {
         "frameMs": frame_ms,
+        "speeds": [list(v) for v in speeds],
+        "rt": tracks,
+        "dayNames": list(DAY_NAMES),
+        "virtualGroups": list(VIRTUAL_GROUPS),
         "states": [{"key": st, "label": STATE_LABELS[st], "color": STATE_COLORS[st]} for st in _STATES],
-        "rooms": [{"key": r, "label": ROOM_LABELS[r], "box": list(ROOM_LAYOUT[r]), "corridor": r == "Corridor"}
+        "rooms": [{"key": r, "label": ROOM_LABELS[r], "short": ROOM_SHORT.get(r, r), "box": list(ROOM_LAYOUT[r]),
+                   "corridor": r == "Corridor"}
                   for r in rooms],
         "machines": [{"id": u, "x": mpos[u][0], "y": mpos[u][1], "kind": _kind(u)} for u in units],
         "workers": workers,
@@ -90,9 +115,9 @@ def build_payload(states, frame_ms=400):
     }
 
 
-def replay3d_html(states, frame_ms=400, height=760):
-    """3D Replay HTML (streamlit.components.v1.html 로 띄움)."""
-    payload = json.dumps(build_payload(states, frame_ms), ensure_ascii=False, separators=(",", ":"))
+def replay3d_html(states, frame_ms=400, height=760, speeds=DEFAULT_SPEEDS, tracks=None):
+    """3D Replay HTML (app.embed_html -> st.iframe 으로 띄움). tracks 를 주면 실시간(이벤트 기반) 모드."""
+    payload = json.dumps(build_payload(states, frame_ms, speeds, tracks), ensure_ascii=False, separators=(",", ":"))
     payload = payload.replace("</", "<\\/")               # </script> 로 끊기지 않게
     return _TEMPLATE.replace("__HEIGHT__", str(int(height))).replace("__PAYLOAD__", payload)
 
@@ -110,6 +135,9 @@ _TEMPLATE = r"""<!doctype html>
   #hud { top:10px; left:10px; padding:8px 12px; font-size:14px; line-height:1.5; }
   #hud .t { font-size:17px; font-weight:700; }
   #hud .k span { margin-right:12px; white-space:nowrap; }
+  #hud .v { font-size:12px; color:var(--muted); }
+  #hud .m { font-size:12px; max-width:560px; }
+  #hud .m .j { color:#b91c1c; font-weight:700; }
   #view { top:10px; right:10px; padding:6px; display:flex; gap:6px; }
   #legend { left:10px; bottom:86px; padding:6px 10px; font-size:12px; display:flex; flex-wrap:wrap; gap:4px 12px; max-width:calc(100% - 20px); }
   #legend i { display:inline-block; width:12px; height:12px; border:1px solid #475569; vertical-align:-2px; margin-right:4px; }
@@ -131,7 +159,8 @@ _TEMPLATE = r"""<!doctype html>
 <body>
 <div id="wrap">
   <canvas id="cv"></canvas>
-  <div id="hud" class="panel"><div class="t" id="hudT"></div><div class="k" id="hudK"></div></div>
+  <div id="hud" class="panel"><div class="t" id="hudT"></div><div class="k" id="hudK"></div>
+    <div class="v" id="hudV"></div><div class="m" id="hudM"></div></div>
   <div id="view" class="panel">
     <button id="vHome" title="처음 시점으로">기본 시점</button>
     <button id="vTop" title="위에서 내려다보기">위에서</button>
@@ -263,9 +292,18 @@ function addWalls() {
 
 // ---------------------------------------------------------------- 동적: 설비 · 작업자 · 주문
 let hits = [];   // {kind, poly|rect, depth, html}
-function addMachines(fr, pulse) {
+function lastStart(segs, T) {    // 시작 시각 <= T 인 마지막 구간 번호 (없으면 -1). segs 는 시작 시각 순
+  let lo = 0, hi = segs.length - 1, k = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (segs[mid][0] <= T) { k = mid; lo = mid + 1; } else hi = mid - 1; }
+  return k;
+}
+function rtMachine(i, T, fallback) {
+  const segs = D.rt.machines[i], k = lastStart(segs, T);
+  return (k >= 0 && T < segs[k][1]) ? segs[k][2] : fallback;
+}
+function addMachines(fr, pulse, T) {
   D.machines.forEach((m, i) => {
-    const st = fr.m[i], color = SC[st], x = m.x, z = m.y;
+    const st = T == null ? fr.m[i] : rtMachine(i, T, fr.m[i]), color = SC[st], x = m.x, z = m.y;
     let w = 0.78, d = 0.7, h = 1.05;
     if (m.kind !== 'printer') { w = 0.8; d = 0.8; h = 0.72; }
     box(x - w / 2, 0, z - d / 2, x + w / 2, h, z + d / 2, color);
@@ -287,6 +325,52 @@ function addMachines(fr, pulse) {
     pushHitBox(corners, `<b>${m.id}</b> · ${key} (${D.states[st].label})`, 1);
   });
 }
+function pathPos(A, B, a) {   // 출발 -> 복도 -> 도착 (경로 길이에 비례), a = 0..1
+  const P = [[A[0], A[1]], [A[0], CORRIDOR_Z], [B[0], CORRIDOR_Z], [B[0], B[1]]];
+  const seg = [0]; for (let i = 1; i < P.length; i++) seg.push(seg[i - 1] + Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]));
+  const L = seg[seg.length - 1] || 1, s = Math.max(0, Math.min(1, a)) * L;
+  for (let i = 1; i < P.length; i++) if (s <= seg[i] + 1e-9) {
+    const k = (s - seg[i - 1]) / ((seg[i] - seg[i - 1]) || 1);
+    return [P[i - 1][0] + (P[i][0] - P[i - 1][0]) * k, P[i - 1][1] + (P[i][1] - P[i - 1][1]) * k];
+  }
+  return [B[0], B[1]];
+}
+function roomSlot(r, slot) { const b = D.rooms[r].box; return [b[0] + 0.4 + slot * 0.55, b[1] + 0.55]; }
+// 실시간 모드 위치 (parameters 배치도와 같은 축척): 문 앞 = 복도 가운데, 작업 위치 = 문에서 방 안쪽으로 ROOM_DEPTH
+function point(r, door, slot, lane) {
+  const g = D.rt.roomGeo[r];
+  if (g.doorX == null) return [6, CORRIDOR_Z];
+  if (door) return [g.doorX, CORRIDOR_Z];
+  return [g.doorX + (slot - 1) * 0.42, CORRIDOR_Z + g.side * (D.rt.depth + lane * 0.16)];
+}
+function rtWorker(j, T) {        // 이벤트 기반 위치: 이동(걷기·운반) 구간만 움직이고, 작업 중·대기 중에는 제자리
+  const w = D.rt.workers[j], k = lastStart(w.segs, T);
+  const at = (r, d) => point(r, d, w.slot, w.lane);
+  if (k < 0) { const [x, z] = at(w.room0, w.door0); return { x, z, busy: false, task: '' }; }
+  const g = w.segs[k];
+  if (T < g[1] && g[2]) {
+    const [x, z] = pathPos(at(g[3], g[4]), at(g[5], g[6]), (T - g[0]) / ((g[1] - g[0]) || 1e-9));
+    return { x, z, busy: true, task: moveText(w.id, g, T), moving: true, carrying: !g[7].startsWith('WALK') };
+  }
+  const [x, z] = at(g[5], g[6]);
+  return T < g[1] ? { x, z, busy: true, task: g[7] } : { x, z, busy: false, task: '' };
+}
+const AMR_Z = () => CORRIDOR_Z + 0.24;            // AMR 주행 차선 (사람은 복도 가운데)
+function rtAmr(k, T) {           // AMR: 적재 xfer 동안 출발 문에 정지 -> 주행 -> 하역 xfer 동안 도착 문에 정지
+  const a = D.rt.amrs[k], i = lastStart(a.segs, T);
+  if (i < 0) return { x: a.x0, loaded: false, task: '대기' };
+  const g = a.segs[i];
+  if (T >= g[1]) return { x: g[3], loaded: false, task: '대기' };
+  const s = g[0] + g[5], e = g[1] - g[5];
+  const f = T <= s ? 0 : T >= e ? 1 : (T - s) / ((e - s) || 1e-9);
+  const phase = g[4] ? (T < s ? '적재 중' : T > e ? '하역 중' : '운반 중') : '빈 차 이동';
+  return { x: g[2] + (g[3] - g[2]) * f, loaded: !!g[4] && T < g[1], task: phase, g };
+}
+function recentJump(j, T) {      // 방금(시뮬레이션 30초 또는 화면 2초 이내) 순간이동했으면 그 기록
+  const win = Math.max(30, 2 * speed) / 3600;
+  for (const J of D.rt.jumps) if (J[0] === j && T >= J[1] && T - J[1] < win) return J;
+  return null;
+}
 function workerPos(fa, fb, j, a) {
   const A = fa.w[j], B = fb.w[j];
   if (a <= 0 || A[3] === B[3] && Math.hypot(A[0] - B[0], A[1] - B[1]) < 1e-6) return [A[0], A[1]];
@@ -301,16 +385,49 @@ function workerPos(fa, fb, j, a) {
   }
   return [B[0], B[1]];
 }
-function addWorkers(fa, fb, a) {
+function addWorkers(fa, fb, a, T) {
   D.workers.forEach((id, j) => {
-    const [x, z] = workerPos(fa, fb, j, a);
-    const busy = fa.w[j][2] === 1, task = fa.w[j][4];
+    let x, z, busy, task;
+    if (T == null) { [x, z] = workerPos(fa, fb, j, a); busy = fa.w[j][2] === 1; task = fa.w[j][4]; }
+    else {
+      const s = rtWorker(j, T); x = s.x; z = s.z; busy = s.busy; task = s.task;
+      if (s.carrying) box(x - 0.09, 0.3, z - 0.2, x + 0.09, 0.42, z - 0.08, ORDER_WAIT, { stroke: 'rgba(120,53,15,.8)' });   // 운반물
+      const J = recentJump(j, T);
+      if (J) {
+        const [gx, gz] = point(J[2], 0, D.rt.workers[j].slot, D.rt.workers[j].lane);
+        circle(gx, 0.3, gz, 0.14, 'rgba(254,226,226,.6)', '#dc2626');                       // 출발 방의 잔상
+        circle(x, 0.47, z, 0.2, 'rgba(254,202,202,.35)', '#dc2626');
+        labels.push({ x, y: 0.95, z, text: `⚡ 순간이동 ${D.rooms[J[2]].short}→${D.rooms[J[3]].short}`, size: 11, bold: true });
+      }
+    }
     const body = busy ? WORKER_BUSY : '#f8fafc';
     box(x - 0.11, 0, z - 0.09, x + 0.11, 0.36, z + 0.09, body, { stroke: 'rgba(13,148,136,.9)' });
     circle(x, 0.47, z, 0.1, busy ? '#99f6e4' : '#ffffff', WORKER_BUSY);
     labels.push({ x, y: 0.72, z, text: id, size: 10 });
     const corners = [[x - 0.14, 0, z], [x + 0.14, 0, z], [x + 0.14, 0.6, z], [x - 0.14, 0.6, z]];
     pushHitBox(corners, `<b>${id}</b> · ${task || '대기 (작업 없음)'}`, 2);
+  });
+}
+function addAmrs(T) {
+  D.rt.amrs.forEach((a, k) => {
+    const s = rtAmr(k, T), x = s.x, z = AMR_Z();
+    box(x - 0.26, 0.04, z - 0.17, x + 0.26, 0.2, z + 0.17, '#334155', { stroke: 'rgba(15,23,42,.8)' });
+    circle(x + 0.18, 0.21, z, 0.035, s.task === '대기' ? '#94a3b8' : '#22c55e', '#0f172a');      // 상태 표시등
+    if (s.loaded) box(x - 0.13, 0.2, z - 0.11, x + 0.13, 0.36, z + 0.11, ORDER_WAIT, { stroke: 'rgba(120,53,15,.8)' });
+    labels.push({ x, y: 0.55, z, text: a.id, size: 10, bold: true });
+    pushHitBox([[x - 0.26, 0, z - 0.17], [x + 0.26, 0, z - 0.17], [x + 0.26, 0.36, z + 0.17], [x - 0.26, 0.36, z + 0.17]],
+               `<b>${a.id}</b> · ${s.task}` + (s.g ? `<br>${s.g[6]}` : ''), 2);
+  });
+}
+function addShelves(fr) {       // 문 앞 선반 (AMR 이 싣고 내리는 곳) + 놓인 운반물 수
+  D.rooms.forEach((r, i) => {
+    const g = D.rt.roomGeo[i];
+    if (g.doorX == null) return;
+    const x = g.doorX + 0.55, z = CORRIDOR_Z + g.side * 0.3, n = (fr.sh || [])[i] || 0;
+    box(x - 0.16, 0, z - 0.08, x + 0.16, 0.22, z + 0.08, '#cbd5e1', { stroke: 'rgba(71,85,105,.7)' });
+    for (let k = 0; k < Math.min(n, 4); k++)
+      box(x - 0.12 + (k % 2) * 0.13, 0.22 + Math.floor(k / 2) * 0.09, z - 0.06, x - 0.01 + (k % 2) * 0.13, 0.3 + Math.floor(k / 2) * 0.09, z + 0.06, ORDER_WAIT);
+    if (n) labels.push({ x, y: 0.5, z, text: `선반 ${n}`, size: 10, chip: true });
   });
 }
 function addOrders(fr) {
@@ -322,13 +439,15 @@ function addOrders(fr) {
     if (r.corridor) { xs = x0 + 0.4; zs = z0 + 0.22; cols = Math.floor((x1 - x0 - 4.5) / gap); }
     else { xs = x0 + 0.3; zs = z1 - 0.32; cols = Math.max(1, Math.floor((x1 - x0 - 0.6) / gap)); }
     const rows = r.corridor ? 2 : 3, perLayer = cols * rows, maxShow = perLayer * 3;
-    const total = proc + wait, shown = Math.min(total, maxShow);
+    const total = proc + wait;
+    let shown = Math.min(total, maxShow);
+    if (D.rt && r.corridor) shown = 0;      // 실시간: 운반 중인 주문은 작업자 손의 운반물로 표시
     for (let k = 0; k < shown; k++) {
       const layer = Math.floor(k / perLayer), rem = k % perLayer, row = Math.floor(rem / cols), col = rem % cols;
       const x = xs + col * gap, z = zs - row * gap * (r.corridor ? -1 : 1), y = layer * (s + 0.01);
       box(x, y, z - s / 2, x + s, y + s, z + s / 2, k < proc ? ORDER_PROC : ORDER_WAIT, { stroke: 'rgba(15,23,42,.45)' });
     }
-    if (total > shown) labels.push({ x: xs + cols * gap * 0.5, y: 3 * (s + 0.01) + 0.15, z: zs, text: `+${total - shown}`, size: 11, bold: true });
+    if (total > shown && !(D.rt && r.corridor)) labels.push({ x: xs + cols * gap * 0.5, y: 3 * (s + 0.01) + 0.15, z: zs, text: `+${total - shown}`, size: 11, bold: true });
     // 방 이름 (바닥 앞쪽) · 방 정보 (뒤쪽 공중)
     if (r.corridor) {
       labels.push({ x: x1 - 2.0, y: 0.05, z: (z0 + z1) / 2, text: `${r.label} · ${text}`, size: 12, floor: true });
@@ -364,7 +483,7 @@ function inside(pt, poly) {
 
 // ---------------------------------------------------------------- 렌더
 let labels = [];
-let playhead = 0, playing = false, speed = 1, lastTs = null;
+let playhead = 0, playing = false, speed = D.speeds[0][0], lastTs = null;
 
 function render(ts) {
   if (camGoal) {   // 시점 전환 부드럽게
@@ -380,8 +499,10 @@ function render(ts) {
   const i = Math.min(N - 1, Math.floor(playhead)), a = playhead - i;
   const fa = D.frames[i], fb = D.frames[Math.min(N - 1, i + 1)];
   const pulse = 0.5 + 0.5 * Math.sin((ts || 0) / 220);
+  const T = D.rt ? fa.t + a * (fb.t - fa.t) : null;          // 실시간 모드: 프레임 사이 연속 시각 [h]
 
-  addFloor(); addWalls(); addOrders(fa); addMachines(fa, pulse); addWorkers(fa, fb, a);
+  addFloor(); addWalls(); addOrders(fa); addMachines(fa, pulse, T); addWorkers(fa, fb, a, T);
+  if (T != null && D.rt.amrs.length) { addAmrs(T); addShelves(fa); }
 
   items.sort((p, q) => (p.layer - q.layer) || (q.depth - p.depth));
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
@@ -401,7 +522,7 @@ function render(ts) {
   }
   ctx.globalAlpha = 1;
   drawLabels();
-  updateHud(fa, i);
+  updateHud(fa, i, T);
 }
 function drawLabels() {
   const L = labels.map(l => Object.assign(l, { q: proj(l.x, l.y, l.z) })).filter(l => l.q).sort((a, b) => b.q[2] - a.q[2]);
@@ -420,12 +541,39 @@ function drawLabels() {
     ctx.fillText(txt, l.q[0], l.q[1]);
   }
 }
-function updateHud(fr, i) {
-  document.getElementById('hudT').textContent = fr.l;
+function fmtT(T) {      // 달력 h -> "Day 2 10:03:27 (화)" (t=0 = Day 1 09:00)
+  const h = T + 9; let day = Math.floor(h / 24) + 1, sec = Math.round((h - (day - 1) * 24) * 3600);
+  if (sec >= 86400) { day += 1; sec -= 86400; }
+  const p = n => String(n).padStart(2, '0');
+  return `Day ${day} ${p(Math.floor(sec / 3600))}:${p(Math.floor(sec / 60) % 60)}:${p(sec % 60)} (${D.dayNames[(day - 1) % 7]})`;
+}
+const CIRC = ['', '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨'];
+const KIND = { WALK: '빈손', HANDOFF: '선반에 놓기', RECEIVE: '선반에서 꺼내기', TRANSPORT: '운반', AMR: '빈 차' };
+const locName = (r, door) => D.rooms[r].short + (door ? ' 문' : '');
+function leftText(e, T) { const left = Math.max(0, Math.round((e - T) * 3600)); return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`; }
+function moveText(id, g, T) {    // "PP2 ② 선반에 놓기 후공정실→후공정실 문 B00003-W1 (10건) · 남은 0:03"
+  const m = /^(WALK|HANDOFF|RECEIVE|TRANSPORT)_?(\d)?\S*\s+(.*)$/.exec(g[7]) || [null, '', '', g[7]];
+  const what = m[1] === 'WALK' ? '' : ' ' + m[3];
+  return `${id} ${CIRC[+m[2]] || ''} ${KIND[m[1]] || ''} ${locName(g[3], g[4])}→${locName(g[5], g[6])}${what} · 남은 ${leftText(g[1], T)}`;
+}
+function updateHud(fr, i, T) {
+  const t = T != null ? fmtT(T) : fr.l;
+  document.getElementById('hudT').textContent = t;
+  document.getElementById('hudV').textContent = '실물 없음(전산): ' + D.virtualGroups.map((g, k) => `${g} ${fr.v[k]}`).join(' · ');
+  if (T != null) {
+    const moves = [];
+    D.rt.workers.forEach(w => { const k = lastStart(w.segs, T); if (k >= 0 && w.segs[k][2] && T < w.segs[k][1]) moves.push(moveText(w.id, w.segs[k], T)); });
+    const amrs = D.rt.amrs.map((a, k) => { const s = rtAmr(k, T); return s.g ? `${a.id} ${s.task} ${s.g[6].replace(/^\S+\s/, '')} · 남은 ${leftText(s.g[1], T)}` : null; }).filter(Boolean);
+    const nj = D.rt.jumps.filter(J => J[1] <= T).length;
+    document.getElementById('hudM').innerHTML = (moves.length ? '🚶 ' + moves.join(' / ') : '이동 중인 작업자 없음') +
+      (D.rt.amrs.length ? '<br>🤖 ' + (amrs.length ? amrs.join(' / ') : 'AMR 대기') : '') +
+      (D.rt.jumps.length ? `<br><span class="j">⚡ 순간이동 ${nj}건</span> / 이 구간 ${D.rt.jumps.length}건 — 이동 이벤트 없이 위치 변경`
+                         : '<br>✓ 순간이동 0건 — 작업자 빈손 이동까지 모두 모델에 있음');
+  }
   document.getElementById('hudK').innerHTML =
     `<span>WIP <b>${fr.k[0]}</b>건</span><span>누적 완료 <b>${fr.k[1]}</b>건</span>` +
     `<span>납기 지연(미완료) <b>${fr.k[2]}</b>건</span><span>레진 누적 <b>${fr.k[3].toFixed(1)}</b> L</span>`;
-  document.getElementById('now').textContent = `${fr.l}  (${i + 1}/${N})`;
+  document.getElementById('now').textContent = T != null ? t : `${t}  (${i + 1}/${N})`;
   if (document.activeElement !== slider) slider.value = i;
 }
 
@@ -450,8 +598,8 @@ function setPlaying(p) {
 playBtn.onclick = () => setPlaying(!playing);
 slider.oninput = () => { playhead = +slider.value; lastTs = null; };
 const sp = document.getElementById('speeds');
-[1, 2, 5, 10].forEach(v => {
-  const b = document.createElement('button'); b.textContent = `×${v}`; if (v === 1) b.classList.add('on');
+D.speeds.forEach(([v, lbl], k) => {
+  const b = document.createElement('button'); b.textContent = lbl; if (k === 0) b.classList.add('on');
   b.onclick = () => { speed = v; [...sp.children].forEach(c => c.classList.toggle('on', c === b)); };
   sp.appendChild(b);
 });
@@ -463,7 +611,10 @@ D.dayTicks.forEach(([idx, lbl]) => {
 const lg = document.getElementById('legend');
 lg.innerHTML = D.states.map(s => `<span><i style="background:${s.color}"></i>${s.key} (${s.label})</span>`).join('') +
   `<span><i class="c" style="background:${WORKER_BUSY}"></i>작업자: 작업 중</span><span><i class="c" style="background:#fff"></i>작업자: 대기</span>` +
-  `<span><i style="background:${ORDER_PROC}"></i>주문: 작업 중</span><span><i style="background:${ORDER_WAIT}"></i>주문: 대기</span>`;
+  `<span><i style="background:${ORDER_PROC}"></i>주문: 작업 중</span><span><i style="background:${ORDER_WAIT}"></i>주문: 대기</span>` +
+  (D.rt ? `<span><i style="background:${ORDER_WAIT}"></i>손·AMR 위 주황 상자: 운반 중</span>` +
+          (D.rt.amrs.length ? `<span><i style="background:#334155"></i>AMR (복도 전용)</span><span><i style="background:#cbd5e1"></i>문 앞 선반</span>` : '') +
+          `<span style="color:#b91c1c">⚡ 순간이동 = 이동 이벤트 없이 위치 변경</span>` : '');
 document.getElementById('vHome').onclick = () => { spin = false; vSpin.classList.remove('on'); camGoal = Object.assign({}, HOME); };
 document.getElementById('vTop').onclick = () => { spin = false; vSpin.classList.remove('on'); camGoal = Object.assign({}, TOP); };
 const vSpin = document.getElementById('vSpin');

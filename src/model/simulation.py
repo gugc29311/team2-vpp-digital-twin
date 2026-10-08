@@ -10,10 +10,20 @@ VPP 공정 시뮬레이션 (SimPy).
   -> 세척: 로드 분할, 로드마다 ② 이동 -> 세척기 확보(정비 점검) -> 적재 -> 세척 -> 인출 (-> 세척액 교체)
   -> UV:   로드 분할, 로드마다 ③ 이동 -> UV 확보(정비 점검) -> 적재 -> 경화 -> 인출
   -> ④ 이동(UV 로드 수만큼) -> Support Removal(부품별) -> Surface Treatment(부품별)
-  -> ⑤ 이동(검사원) -> Inspection(부품별) -> 합격: Packaging(검사원 겸직 / 포장 담당) / 불합격: 재출력 또는 폐기
+  -> ⑤ 이동(검사원) -> Inspection(부품별, 불합격: 재출력 또는 폐기)
+  -> ⑥ 이동(배치의 합격품, 검사실 -> 포장실) -> Packaging(검사원 겸직 / 포장 담당)
 
 근무 캘린더 사용 시: 사람 작업·세척·UV·정비는 근무시간만 소비, 프린터 투입(적재)은 근무시간에만,
 출력 자체는 PRINTER_UNATTENDED 이면 달력시간으로 연속 진행.
+
+이동 (MOVE_TIME_MODE = "distance", 가정 배치도 ROOM_DOOR_X_M)
+  - 작업자는 늘 어느 방의 작업 위치 또는 문 앞(복도)에 있다. 다른 곳의 작업을 시작하기 전에 빈손으로 걸어감 (WALK).
+    작업은 그 장소에서 가장 가까운 빈 작업자에게 배정 (같으면 번호가 작은 사람)
+  - 운반 TRANSPORT_MODE = "amr": 보내는 사람이 작업 위치 -> 문 앞 선반 (HANDOFF) -> AMR 이 빈 차로 출발 문까지 온 뒤
+    (AMR_MOVE) 자동 적재 -> 복도 주행 -> 도착 문 앞 선반에 자동 하역 (TRANSPORT) -> 받는 사람이 선반 -> 작업 위치 (RECEIVE)
+  - TRANSPORT_MODE = "worker": 받는 쪽 작업자가 출발 작업 위치 -> 도착 작업 위치까지 들고 감 (TRANSPORT)
+  - 시간 = 거리 ÷ 속도 (+ 선반 놓기·꺼내기, AMR 적재·하역). 사람 이동은 근무시간만 소비, AMR 은 달력시간
+MOVE_TIME_MODE = "fixed" 는 기존 방식 (운반 1회 = DEFAULT_TRANSPORT_TIME, 빈손 이동 없음 — 로직 테스트용).
 
 실행 (프로젝트 최상위 폴더):  python main.py   |   python -m src.model.simulation
 """
@@ -23,7 +33,8 @@ from dataclasses import dataclass, field
 import simpy
 
 from src.analysis.event_log import EventLog
-from src.analysis.event_schema import order_ids, process_of, state_of
+from src.analysis.event_schema import (TRANSPORT_ROUTES, VIRTUAL_LOCATION, order_ids, process_of, route_parts,
+                                       state_of)
 from src.entities.batch import Batch
 from src.entities.order import make_parts
 from src.model.config import SimConfig
@@ -32,6 +43,8 @@ from src.resources.resources import FactoryResources
 from src.scheduler import dispatch
 from src.utils.calendar import make_calendar
 from src.utils.random_utils import make_streams, sample
+
+DOOR = ":door"          # 위치 표기 "방:door" = 그 방 문 앞 (복도)
 
 
 @dataclass
@@ -50,6 +63,10 @@ class SimulationResult:
     workers: dict = field(default_factory=dict)      # 역할 -> 작업자 개인 ID 목록 (JA1.., PP1.., QI1..)
     machine_phases: list = field(default_factory=list)  # (설비, 상태 6종, 시작, 끝) — [0, 종료] 를 빈틈없이 덮음
     worker_queue: list = field(default_factory=list)    # [역할, 요청, 작업 시작(None=대기 중)] 인력 대기
+    unit_jobs: list = field(default_factory=list)       # (설비, 시작, 끝, 부품 수) 설비 대별 처리 기록
+    amr_trips: list = field(default_factory=list)       # (AMR, 배정, 운반 시작, 끝, 출발 방, 도착 방, 부품 수)
+    amr_queue: list = field(default_factory=list)       # [AMR 요청, 배정(None=대기 중)]
+    worker_home: dict = field(default_factory=dict)     # 작업자 -> 시작 위치 (Replay 용)
 
 
 class VPPSimulation:
@@ -77,8 +94,16 @@ class VPPSimulation:
         self.load_queue = []              # 세척·UV 로드 대기 구간 (keep_events 와 무관하게 기록 -> 대기 KPI)
         self.machine_phases = []          # 설비 상태 구간 (keep_events 와 무관하게 기록 -> 상태별 시간 KPI)
         self.worker_queue = []            # 인력 대기 구간 (요청 -> 첫 작업 시작, 근무시간 대기 포함) -> 인력 대기 KPI
+        self.unit_jobs = []               # 설비 대별 처리 (출력 배치·세척/UV 로드) -> 장비 대별 처리량 KPI
         self.all_done = self.env.event()
         self._ps_cache = {}               # (대상 종류, 이벤트, 공정) -> (공정, 상태) — 주문 Current State 갱신용
+        # 이동: 작업자·AMR 의 현재 위치 ("방" = 작업 위치, "방:door" = 그 방 문 앞 복도)
+        self.walking = cfg.MOVE_TIME_MODE == "distance"
+        self.worker_loc = {w: self._room(self._ROLE_HOME[role]) for role, ids in self.res.workers.items() for w in ids}
+        self.worker_home = dict(self.worker_loc)
+        self.amr_loc = {a: cfg.AMR_HOME + DOOR for a in self.res.amr_ids}
+        self.amr_trips = []
+        self.amr_queue = []
 
     # =====================================================
     # 실행
@@ -103,7 +128,8 @@ class VPPSimulation:
         caps = {name: self.res.capacity_of(name) for name, _ in FactoryResources.TRACKED}
         return SimulationResult(cfg, self.orders, self.batches, self.log, env.now, self.cal, caps,
                                 self.res.all_units, self.resin_log, self.printed_parts, self.load_queue,
-                                self.res.workers, self.machine_phases, self.worker_queue)
+                                self.res.workers, self.machine_phases, self.worker_queue, self.unit_jobs,
+                                self.amr_trips, self.amr_queue, self.worker_home)
 
     # =====================================================
     # 공통 도구
@@ -209,14 +235,20 @@ class VPPSimulation:
         self.worker_queue.append(wait_rec)
         with resource.request() as req:
             yield req
-            who = self.res.take_worker(res_name)
+            dest0 = self._task_locs(tasks[0][0], process)[0] if tasks else None
+            who = self.res.take_worker(res_name, self._nearest(dest0))
             try:
                 for i, (task, hours) in enumerate(tasks):
+                    a, b = self._task_locs(task, process)
+                    walked = yield from self._walk_to(who, res_name, a, t_req if wait_rec[2] is None else None)
+                    if walked is not None and wait_rec[2] is None:
+                        wait_rec[2] = walked                          # 대기 = 요청 -> 이 작업자가 움직이기 시작
                     yield from self.cal.wait_open(self.env)          # 근무시간이 될 때까지 대기한 뒤 기록
                     start = self.env.now
-                    wait = start - t_req if i == 0 else 0.0          # 자원 대기 + 근무시간 대기
-                    if i == 0:
+                    wait = 0.0
+                    if wait_rec[2] is None:
                         wait_rec[2] = start
+                        wait = start - t_req                         # 자원 대기 + 근무시간 대기
                     self._log(start, entity_type, entity_id, f"{task}_START", who,
                               f"wait={wait:.2f}h" if wait > 1e-9 else "", ref, process)
                     if i == 0 and on_start is not None:
@@ -225,16 +257,134 @@ class VPPSimulation:
                     self._log(self.env.now, entity_type, entity_id, f"{task}_END", who, "", ref, process)
                     self.log.add_busy(res_name, start, self.env.now, hours)
                     self.log.add_person_busy(who, res_name, start, self.env.now, hours)
+                    if self.walking and b is not None:
+                        self.worker_loc[who] = b
             finally:
                 self.res.release_worker(res_name, who)
 
-    def _transport_time(self):
-        return self._t(self.cfg.DEFAULT_TRANSPORT_TIME, "transport") if self.cfg.TRANSPORT_ENABLED else 0.0
+    # ---- 위치 · 거리 · 이동
+    _ROLE_HOME = {"job_assignment_workers": "Job Assignment", "post_process_workers": "Support Removal",
+                  "quality_inspectors": "Inspection", "packers": "Packaging", "printer_operators": "VPP Build"}
+    # AMR 모드에서 출발 방 작업 위치 -> 문 앞 선반까지 들고 나오는 사람 (보내는 쪽). 받는 쪽은 기존 규칙 그대로
+    _SENDER = {"1_PRINT_TO_REMOVAL": "post_process_workers", "2_TO_WASHING": "post_process_workers",
+               "3_TO_UV": "post_process_workers", "4_TO_SUPPORT": "post_process_workers",
+               "5_TO_INSPECTION": "post_process_workers", "6_TO_PACKING": "quality_inspectors"}
 
-    def _transport(self, res_name, entity_type, entity_id, segment, ref=None):
-        if self.cfg.TRANSPORT_ENABLED:
-            yield from self._work(res_name, [(f"TRANSPORT_{segment}", self._transport_time())],
-                                  entity_type, entity_id, ref)
+    def _room(self, process):
+        return self.cfg.LOCATIONS[process]
+
+    def _dist(self, a, b):
+        """위치 a -> b 이동 거리 [m]: 출발 깊이 + |문 위치 차이| + 도착 깊이 (문 앞이면 깊이 0)."""
+        if a == b:
+            return 0.0
+        ra, rb = a.split(":")[0], b.split(":")[0]
+        depth = self.cfg.ROOM_DEPTH_M
+        if ra == rb:
+            return depth                                     # 같은 방의 작업 위치 <-> 문
+        X = self.cfg.ROOM_DOOR_X_M
+        return (0.0 if a.endswith(DOOR) else depth) + abs(X[ra] - X[rb]) + (0.0 if b.endswith(DOOR) else depth)
+
+    @staticmethod
+    def _hours(meters, speed):
+        return meters / speed / 3600.0
+
+    def _task_locs(self, task, process=None):
+        """작업 (시작 위치, 끝 위치). 실물 없는 단계(Virtual)는 (None, None)."""
+        rp = route_parts(task)
+        if rp:
+            prefix, seg = rp
+            o, d = (self._room(p) for p in TRANSPORT_ROUTES[seg])
+            if prefix == "HANDOFF_":
+                return o, o + DOOR
+            if prefix == "RECEIVE_":
+                return d + DOOR, d
+            return o, d                                      # 사람이 직접 운반 (worker 모드)
+        room = self._room(process or process_of(task))
+        return (None, None) if room in (VIRTUAL_LOCATION, "Corridor") else (room, room)
+
+    def _nearest(self, dest):
+        """작업자 배정 기준: dest 까지 가까운 사람 (이동 모델이 꺼져 있으면 None = 번호 순)."""
+        if not self.walking or dest is None:
+            return None
+        return lambda w: self._dist(self.worker_loc[w], dest)
+
+    def _walk_to(self, who, res_name, dest, t_req=None):
+        """작업자 who 가 dest 에 없으면 빈손으로 걸어감 (WALK, 근무시간 소비). 반환: 걷기 시작 시각 (안 걸으면 None)."""
+        here = self.worker_loc.get(who)
+        if not self.walking or dest is None or here == dest:
+            return None
+        yield from self.cal.wait_open(self.env)
+        start = self.env.now
+        hours = self._hours(self._dist(here, dest), self.cfg.WALK_SPEED_M_S)
+        wait = start - t_req if t_req is not None else 0.0
+        self._log(start, "WORKER", who, "WALK_START", who, f"{here}->{dest}" + (f" wait={wait:.2f}h" if wait > 1e-9 else ""))
+        yield from self.cal.delay(self.env, hours)
+        self._log(self.env.now, "WORKER", who, "WALK_END", who, "")
+        self.log.add_busy(res_name, start, self.env.now, hours)
+        self.log.add_person_busy(who, res_name, start, self.env.now, hours)
+        self.worker_loc[who] = dest
+        return start
+
+    def _transport(self, res_name, entity_type, entity_id, segment, ref=None, then=()):
+        """
+        운반 구간 segment (TRANSPORT_ROUTES). res_name = 받는 쪽 역할, then = 받은 사람이 이어서 할 작업.
+        TRANSPORT_ENABLED 가 False 면 then 만 수행.
+        """
+        c = self.cfg
+        then = list(then)
+        if not c.TRANSPORT_ENABLED:
+            if then:
+                yield from self._work(res_name, then, entity_type, entity_id, ref)
+            return
+        task = f"TRANSPORT_{segment}"
+        if c.TRANSPORT_MODE == "worker":
+            if c.MOVE_TIME_MODE == "fixed":
+                hours = self._t(c.DEFAULT_TRANSPORT_TIME, "transport")
+            else:
+                hours = self._hours(self._dist(*self._task_locs(task)), c.CARRY_SPEED_M_S)
+            yield from self._work(res_name, [(task, hours)] + then, entity_type, entity_id, ref)
+            return
+        carry = self._hours(c.ROOM_DEPTH_M, c.CARRY_SPEED_M_S)          # 작업 위치 <-> 문 앞 선반
+        yield from self._work(self._SENDER[segment],
+                              [(f"HANDOFF_{segment}", carry + self._t(c.SHELF_HANDLING_TIME, "transport"))],
+                              entity_type, entity_id, ref)
+        yield from self._amr_carry(segment, entity_type, entity_id, ref)
+        yield from self._work(res_name, [(f"RECEIVE_{segment}", self._t(c.SHELF_HANDLING_TIME, "transport") + carry)]
+                              + then, entity_type, entity_id, ref)
+
+    def _amr_carry(self, segment, entity_type, entity_id, ref):
+        """
+        AMR 운반: 가장 가까운 빈 AMR 이 출발 문까지 빈 차로 이동(AMR_MOVE) -> 선반에서 자동 적재 -> 복도 주행
+        -> 도착 문 앞 선반에 자동 하역 (TRANSPORT, resource = AMR ID). AMR 은 근무시간과 무관하게 움직임.
+        """
+        c, env = self.cfg, self.env
+        o, d = (self._room(p) for p in TRANSPORT_ROUTES[segment])
+        src, dst = o + DOOR, d + DOOR
+        rec = [env.now, None]
+        self.amr_queue.append(rec)
+        with self.res.amrs.request() as req:
+            yield req
+            free = self.res.amr_free
+            amr = min(free, key=lambda a: (self._dist(self.amr_loc[a], src), self.res.amr_ids.index(a)))
+            free.remove(amr)
+            try:
+                start = rec[1] = env.now
+                if self.amr_loc[amr] != src:
+                    self._log(start, "AMR", amr, "AMR_MOVE_START", amr, f"{self.amr_loc[amr]}->{src}")
+                    yield env.timeout(self._hours(self._dist(self.amr_loc[amr], src), c.AMR_SPEED_M_S))
+                    self._log(env.now, "AMR", amr, "AMR_MOVE_END", amr, "")
+                    self.amr_loc[amr] = src
+                t0 = env.now
+                xfer = self._t(c.AMR_TRANSFER_TIME, "transport")
+                self._log(t0, entity_type, entity_id, f"TRANSPORT_{segment}_START", amr, f"transfer={xfer:.9f}h", ref)
+                yield env.timeout(xfer + self._hours(self._dist(src, dst), c.AMR_SPEED_M_S) + xfer)
+                self._log(env.now, entity_type, entity_id, f"TRANSPORT_{segment}_END", amr, "", ref)
+                self.amr_loc[amr] = dst
+                n = len(ref) if isinstance(ref, (list, tuple)) else 1
+                self.amr_trips.append((amr, start, t0, env.now, o, d, n))
+                self.log.add_busy("amrs", start, env.now, self.cal.work_hours(start, env.now))
+            finally:
+                free.append(amr)
 
     def _get_unit(self, pool_name, for_id=""):
         """
@@ -357,6 +507,7 @@ class VPPSimulation:
             if wait is not None:
                 self.env.process(self._batch_timer(b, wait))
         b.parts.append(part)
+        part.batch, part.batched_time = b, self.env.now
         self._log(self.env.now, "PART", part.part_id, "ADDED_TO_BATCH", "", b.batch_id, part)
         trig = self._full_trigger(b)
         if trig:
@@ -405,7 +556,7 @@ class VPPSimulation:
         with self.res.vpp_printers.request(priority=self._priority(b)) as req:
             yield req
             unit = yield from self._get_unit("vpp_printers", b.batch_id)
-            b.print_start = env.now
+            b.print_start, b.printer = env.now, unit.name
             self._log(env.now, "BATCH", b.batch_id, "VPP_BUILD_START", unit.name,
                       f"build={b.build_time:.2f}h wait={env.now - t_req:.2f}h", b)
             # 장비 상태: 셋업(Setup) -> 층 출력(Running). 출력 대기는 기존대로 한 번 (총 시간·이벤트 순서 불변),
@@ -430,6 +581,7 @@ class VPPSimulation:
             self.res.printer_pool.put(unit)
             self._log(env.now, "BATCH", b.batch_id, "VPP_BUILD_END", unit.name, "", b)
             self.log.add_busy("vpp_printers", b.print_start, b.print_end, b.build_time)
+            self.unit_jobs.append((unit.name, b.print_start, b.print_end, b.n_parts))
         if self.printer_only:
             return
 
@@ -444,9 +596,8 @@ class VPPSimulation:
 
         # ---- ① 이동 + Part Removal (한 번의 점유)
         removal = self._t(c.PART_REMOVAL_TIME) + sum(self._t(c.PART_REMOVAL_TIME_PER_PART) for _ in good)
-        tasks = ([("TRANSPORT_1_PRINT_TO_REMOVAL", self._transport_time())] if c.TRANSPORT_ENABLED else []) \
-            + [("PART_REMOVAL", removal)]
-        yield from self._work("post_process_workers", tasks, "BATCH", b.batch_id, good)
+        yield from self._transport("post_process_workers", "BATCH", b.batch_id, "1_PRINT_TO_REMOVAL", good,
+                                   then=[("PART_REMOVAL", removal)])
 
         # ---- 세척 / UV (로드 단위)
         yield from self._machine_stage(b, good, "washing_machines", c.WASHING_LOAD_CAPACITY,
@@ -469,10 +620,22 @@ class VPPSimulation:
                 yield from self._work("post_process_workers",
                                       [("SURFACE_TREATMENT", self._t(c.SURFACE_TREATMENT_TIME))], "PART", p.part_id, p)
 
-        # ---- ⑤ 이동 + Inspection (+ Packaging)
+        # ---- ⑤ 이동 + Inspection -> ⑥ 이동(합격품, 검사실 -> 포장실) + Packaging
         yield from self._transport("quality_inspectors", "BATCH", b.batch_id, "5_TO_INSPECTION", good)
+        passed = []
         for p in good:
-            yield from self._inspect(p)
+            ok = yield from self._inspect(p)
+            if ok:
+                passed.append(p)
+        if not passed:
+            return
+        packer = "quality_inspectors" if self.res.packers is None else "packers"   # 받는 쪽(포장 담당)이 이동
+        yield from self._transport(packer, "BATCH", b.batch_id, "6_TO_PACKING", passed)
+        for p in passed:
+            if self.res.packers is None:
+                yield from self._pack(p, packer)                 # 검사원 겸직: 차례로 포장
+            else:
+                self.env.process(self._pack(p, packer))          # 포장 담당: 부품별 병렬 요청
 
     def _record_print(self, b):
         """출력 시작 시점 기록: 출력 부품(재출력 비중), 레진 소모 [공통3]."""
@@ -527,6 +690,7 @@ class VPPSimulation:
             self._log(self.env.now, "LOAD", load_id, f"{task}_END", unit.name, "", load)
             self.log.add_busy(machine, start, self.env.now, self.cal.work_hours(start, self.env.now))
             unit.loads += 1
+            self.unit_jobs.append((unit.name, start, self.env.now, len(load)))
             n = c.CLEANING_LIQUID_CHANGE_EVERY_LOADS
             if machine == "washing_machines" and n and unit.loads % n == 0:
                 self.env.process(self._clean_and_return(unit, pool))
@@ -541,39 +705,32 @@ class VPPSimulation:
         self.worker_queue.append(wait_rec)
         with self.res.quality_inspectors.request() as req:
             yield req
-            who = self.res.take_worker("quality_inspectors")
+            room = self._room("Inspection")
+            who = self.res.take_worker("quality_inspectors", self._nearest(room))
             try:
+                walked = yield from self._walk_to(who, "quality_inspectors", room, t_req)
+                wait_rec[2] = walked
                 yield from self.cal.wait_open(env)               # 근무시간이 될 때까지 대기한 뒤 기록
                 start = env.now
-                wait_rec[2] = start
+                wait = 0.0
+                if wait_rec[2] is None:
+                    wait_rec[2], wait = start, start - t_req
                 self._log(start, "PART", p.part_id, "INSPECTION_START", who,
-                          f"wait={start - t_req:.2f}h" if start - t_req > 1e-9 else "", p)
+                          f"wait={wait:.2f}h" if wait > 1e-9 else "", p)
                 d = self._t(c.INSPECTION_TIME)
                 yield from self.cal.delay(env, d)
                 defect = c.INSPECTION_FAILURE_RATE > 0 and self.rng["quality"].random() < c.INSPECTION_FAILURE_RATE
                 self._log(env.now, "PART", p.part_id, "INSPECTION_END", who, "FAIL" if defect else "PASS", p)
                 self.log.add_busy("quality_inspectors", start, env.now, d)
                 self.log.add_person_busy(who, "quality_inspectors", start, env.now, d)
-                if not defect and self.res.packers is None:
-                    yield from self.cal.wait_open(env)
-                    ps = env.now
-                    self._log(ps, "PART", p.part_id, "PACKAGING_START", who, "", p)
-                    d = self._t(c.PACKAGING_TIME)
-                    yield from self.cal.delay(env, d)
-                    self._log(env.now, "PART", p.part_id, "PACKAGING_END", who, "", p)
-                    self.log.add_busy("quality_inspectors", ps, env.now, d)
-                    self.log.add_person_busy(who, "quality_inspectors", ps, env.now, d)
             finally:
                 self.res.release_worker("quality_inspectors", who)
         if defect:
             self._reject(p, "INSPECTION_FAILED")
-        elif self.res.packers is not None:
-            self.env.process(self._pack(p))
-        else:
-            self._part_done(p)
+        return not defect
 
-    def _pack(self, p):
-        yield from self._work("packers", [("PACKAGING", self._t(self.cfg.PACKAGING_TIME))], "PART", p.part_id, p)
+    def _pack(self, p, role="packers"):
+        yield from self._work(role, [("PACKAGING", self._t(self.cfg.PACKAGING_TIME))], "PART", p.part_id, p)
         self._part_done(p)
 
     # =====================================================

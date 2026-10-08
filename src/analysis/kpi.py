@@ -10,6 +10,8 @@ KPI 계산 · 요약 출력 · CSV 저장.
   utilization  : 자원별 가동률 = 점유 근무시간 / (용량 x 가용시간)
                  가용시간: 사람·세척·UV = 근무시간, 프린터 = 무인운전이면 달력시간
   kpis         : 반복실험·회귀검증용 스칼라 KPI 모음 (프린터 부하율 ρ = 정의 B 포함)
+  unit_table   : 설비 대별 가동률·처리량·상태 시간 (개발자 검증용 — 종류별 합산 가동률로는 안 보이는 대별 차이)
+  order_stage_table : 주문별 단계 시간 (접수 -> 작업 배정 -> 배치 형성 -> 프린터 대기 -> 출력 -> 후공정~포장)
 """
 import csv
 import os
@@ -150,6 +152,90 @@ def machine_state_hours(res):
     return out
 
 
+UNIT_KINDS = (("WASH", "세척기"), ("UV", "UV기"), ("P", "프린터"))
+
+
+def _unit_kind(name):
+    return next(label for prefix, label in UNIT_KINDS if name.startswith(prefix))
+
+
+def unit_table(res):
+    """
+    설비 대별 지표 (측정 구간) — 개발 단계 검증용.
+      가동률 = (Running + Setup) / 가용시간. 가용시간: 무인운전 프린터 = 달력시간, 그 외 = 근무시간.
+        (종류별 utilization() 은 세척·UV 의 적재~인출 전체(인출 작업자 대기 포함)를 점유로 보므로 세척·UV 는 이 값보다 큼.
+         프린터는 두 정의가 같다: 출력 시작~종료 = Setup + Running)
+      처리 건수 = 측정 구간에 끝난 출력 배치(프린터) / 로드(세척·UV), 처리 부품 = 그 부품 수 합.
+    """
+    cfg, cal = res.cfg, res.calendar
+    t0, t1 = measure_start(res), res.end_time
+    weeks = _weeks(res)
+    hours = machine_state_hours(res)
+    jobs = {}
+    for name, s, e, n in res.unit_jobs:
+        if t0 <= e <= t1:
+            j = jobs.setdefault(name, [0, 0])
+            j[0] += 1
+            j[1] += n
+    rows = []
+    for u in res.units:
+        h = hours[u.name]
+        calendar_time = u.kind == "printer" and (not cfg.USE_WORK_CALENDAR or cfg.PRINTER_UNATTENDED)
+        avail = (t1 - t0) if calendar_time else cal.work_hours(t0, t1)
+        n_jobs, n_parts = jobs.get(u.name, (0, 0))
+        fails = sum(1 for kind, s, e in u.log if kind == "fail" and t0 <= s < t1)
+        rows.append({
+            "unit": u.name, "kind": _unit_kind(u.name),
+            "utilization": (h["Running"] + h["Setup"]) / avail if avail > 0 else float("nan"),
+            "jobs": n_jobs, "parts": n_parts,
+            "parts_per_week": n_parts / weeks if weeks else float("nan"),
+            "failures": fails,
+            **{f"{st.lower()}_h": h[st] for st in MACHINE_STATES},
+        })
+    return rows
+
+
+# 주문 단계 (키, 이름) — order_stage_table 의 열 순서
+ORDER_STAGES = (("ja", "접수 → 작업 배정 완료"), ("batch", "배치 형성 대기"), ("queue", "프린터 대기"),
+                ("print", "출력"), ("post", "후공정 ~ 포장 완료"))
+
+
+def order_stage_table(res):
+    """
+    측정 구간에 도착해 완료된 주문의 단계별 달력시간 [h].
+      ja    = 도착 -> 배치 투입 (작업 배정 대기 + 처리)
+      batch = 배치 투입 -> 배치 확정 (면적·시간 조건 대기)
+      queue = 배치 확정 -> 출력 시작 (출력 준비 + 프린터 대기)
+      print = 출력 시작 -> 출력 종료
+      post  = 출력 종료 -> 주문 완료 (이동·탈거·세척·UV·후처리·검사·포장, 재출력이 있으면 재출력 전체 포함)
+    부품이 여러 개면 최초 출력 부품(재출력 제외) 중 가장 늦은 시각 기준. pre_print = ja + batch + queue (생산 시작 전 대기),
+    after_start = print + post (생산 시작 후 납품까지).
+    """
+    t0 = measure_start(res)
+    first = {}
+    for b in res.batches:
+        for p in b.parts:
+            if p.gen == 0:
+                first.setdefault(p.order.order_id, []).append(p)
+    rows = []
+    for o in res.orders:
+        ps = first.get(o.order_id)
+        if o.arrival_time < t0 or o.completed_time is None or not ps                 or any(p.batch.print_end is None for p in ps):
+            continue
+        ja_end = max(p.batched_time for p in ps)
+        closed = max(p.batch.closed_time for p in ps)
+        start = max(p.batch.print_start for p in ps)
+        end = max(p.batch.print_end for p in ps)
+        r = {"order_id": o.order_id, "priority": o.priority, "reworks": o.reworks,
+             "ja": ja_end - o.arrival_time, "batch": closed - ja_end, "queue": start - closed,
+             "print": end - start, "post": o.completed_time - end}
+        r["pre_print"] = r["ja"] + r["batch"] + r["queue"]
+        r["after_start"] = r["print"] + r["post"]
+        r["lead"] = o.completed_time - o.arrival_time
+        rows.append(r)
+    return rows
+
+
 def _downtime(res, prefix):
     """설비 종류별 측정 구간 고장·PM·세척액 교체 횟수와 다운 시간."""
     t0, t1 = measure_start(res), res.end_time
@@ -264,6 +350,17 @@ def kpis(res):
         k[f"{name}_down_h_per_week"] = d["down_h"] / weeks if weeks else nan
         if name == "washing":
             k["washing_liquid_changes_per_week"] = d["clean"] / weeks if weeks else nan
+
+    # AMR: 호출 대기 (요청 -> 배정), 운반 횟수
+    aq = [b - a for a, b in getattr(res, "amr_queue", []) if a >= t0 and b is not None]
+    k["amr_wait_h_mean"] = float(np.mean(aq)) if aq else nan
+    trips = [x for x in getattr(res, "amr_trips", []) if x[3] >= t0]
+    k["amr_trips_per_week"] = len(trips) / weeks if weeks and trips else (0.0 if weeks else nan)
+
+    # 주문 단계별 시간 (달력 h): 생산 시작 전 대기 vs 생산 시작 후 납품까지
+    st = order_stage_table(res)
+    for key in [k_ for k_, _ in ORDER_STAGES] + ["pre_print", "after_start"]:
+        k[f"stage_{key}_h_mean"] = float(np.mean([r[key] for r in st])) if st else nan
 
     # 설비별·상태별 시간 [h/주] (P1_running_h_per_week ...)
     for unit, hours in machine_state_hours(res).items():

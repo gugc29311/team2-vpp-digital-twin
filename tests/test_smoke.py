@@ -87,7 +87,7 @@ def test_busy_hours_match_hand_calculation(run_logic):
     assert u["job_assignment_workers"]["busy_h"] == pytest.approx(1 * 10 + 2 * n_batches)
     transport = 0.5 * (n_batches + 3 * n_load)                        # ① + ② + ③ + ④
     assert u["post_process_workers"]["busy_h"] == pytest.approx(transport + 1 * n_batches + 4 * n_parts)
-    assert u["quality_inspectors"]["busy_h"] == pytest.approx(0.5 * n_batches + 2 * n_parts)
+    assert u["quality_inspectors"]["busy_h"] == pytest.approx((0.5 + 0.5) * n_batches + 2 * n_parts)   # ⑤ + ⑥
 
 
 def test_worker_count_changes_result(run_logic):

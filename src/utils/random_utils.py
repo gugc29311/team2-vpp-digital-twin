@@ -63,3 +63,18 @@ def mean(spec):
     kind, p, scale = parse(spec)
     m = {"const": p[0], "tri": sum(p) / 3, "uniform": sum(p) / 2, "exp": p[0]}[kind]
     return m * (scale if scale is not None else 1.0)
+
+
+def std(spec):
+    """분포의 이론 표준편차 (hour 변환 포함) — 관측 평균의 허용 오차(3σ/√n) 계산용."""
+    kind, p, scale = parse(spec)
+    if kind == "const":
+        s = 0.0
+    elif kind == "tri":
+        a, c, b = p                                     # 최소, 최빈, 최대
+        s = ((a * a + b * b + c * c - a * b - a * c - b * c) / 18) ** 0.5
+    elif kind == "uniform":
+        s = (p[1] - p[0]) / 12 ** 0.5
+    else:
+        s = p[0]
+    return s * (scale if scale is not None else 1.0)

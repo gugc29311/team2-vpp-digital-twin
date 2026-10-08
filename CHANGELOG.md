@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.1.2 - 2026.10.08
+
+### Added
+- AMR 운반 (`TRANSPORT_MODE = "amr"`, 기본): 보내는 사람이 작업 위치 -> 문 앞 선반 (`HANDOFF_*`), AMR 이 복도만 주행해
+  도착 문 앞 선반에 자동 하역 (`TRANSPORT_*`, resource = AMR1/AMR2, 빈 차 이동 `AMR_MOVE`), 받는 사람이 선반 -> 작업 위치
+  (`RECEIVE_*`). 가장 가까운 빈 AMR 출동. `AMR_COUNT=2`, `AMR_SPEED_M_S`, `AMR_TRANSFER_TIME`, `AMR_HOME` (가정값).
+  `"worker"` = 사람이 직접 운반 (비교 시나리오)
+- 이동시간 = 거리 ÷ 속도 (`MOVE_TIME_MODE = "distance"`, 가정 배치도 `ROOM_DOOR_X_M`·`ROOM_DEPTH_M`, 걷기·짐·AMR 속도,
+  선반 놓기/꺼내기 시간). 작업자 **빈손 이동(`WALK`)까지 모두 모델링** -> 작업자 순간이동 0건.
+  작업은 그 장소에서 가장 가까운 빈 작업자에게 배정. `"fixed"` = 기존 방식 (로직 테스트용)
+- 이동 ⑥ 검사실 -> 포장실 (`TRANSPORT_6_TO_PACKING`): 배치의 합격품을 포장 담당(없으면 검사원)이 옮긴 뒤 포장.
+  단일 주문 손계산 46.5h -> 47h, 이벤트 39개 -> 41개
+- KPI `util_amrs`, `amr_wait_h_mean`, `amr_trips_per_week`, `unit_table` (설비 대별 가동률·처리 건수·부품·고장·상태 시간),
+  `order_stage_table` + `stage_*_h_mean` (접수 -> 작업 배정 -> 배치 형성 -> 프린터 대기 -> 출력 -> 후공정~포장)
+- 대시보드 화면 2종: 고객용 (요약 지표 · 주문 단계별 시간 · 3D Replay) / 개발자용 (설비·작업자 상세, AMR 표,
+  주문 대기시간 분해, 검증 탭)
+- 3D Replay 실시간 모드 (1초 = 1초, 개발자용): 작업자·AMR·설비 상태를 이벤트 시각 그대로 그림. 문 앞 선반, 운반물·남은 시간 표시,
+  이동 이벤트 없이 방이 바뀌면 순간이동 표시 (`data.replay_tracks`)
+- 검증: `src/validation/crosscheck.py` (설정값 <-> 관측값 교차 검증, 이동 1건마다 시간 = 거리 ÷ 속도),
+  `src/validation/locations.py` (부품·작업자 순간이동)
+- `tools/verify_claims.py` + `docs/verify_claims.md`: 분석 해석 5개를 원인을 바꾸는 실험 · 시드 5개로 검증
+- `docs/VPP_검증_문서.md`: 손계산 비교 · 교차 검증 · 경계 조건 · 위치 연속성 · 해석 검증
+- 기록: `Part.batch`, `Part.batched_time`, `Batch.printer`, `SimulationResult.unit_jobs` (동작·난수 영향 없음)
+- 테스트: `tests/test_boundary.py` (불량 0, 고장 OFF/잦음, 인력 최소/넉넉, 처리시간 극단, 이동 OFF/1h 손계산, 순간이동 검출,
+  교차 검증), `tests/test_replay.py` (Replay 화면 데이터 = `state_at`, 설비 안 부품 = 작업 중, requirements 인코딩)
+
+### Changed
+- `LOCATIONS`: 주문 접수·배치 구성 = `Virtual` (실물 없음, v0.1.1 의 `Print Room` 에서 변경). 작업 배정은 `Print Room` 유지.
+  Replay 에서 방이 아니라 '실물 없음(전산)' 으로 따로 셈
+- 회귀 기대 범위 `util_post_process_workers` 0.48~0.53 -> 0.44~0.49 (운반 1회 평균 2.3분 -> 수십 초)
+- 로직 테스트 설정(LOGIC_CFG)은 `TRANSPORT_MODE="worker"`, `MOVE_TIME_MODE="fixed"` 로 기존 손계산 유지
+- `main.py`: 어느 폴더에서 실행해도 프로젝트 최상위 폴더 기준으로 동작 (VS Code ▶ 실행 가능).
+  `--orders`·`--out` 에 준 상대경로는 실행한 위치 기준 (기본 `outputs/` 는 프로젝트 폴더)
+- 교차 검증: 재출력·AMR 운반 3단계를 개수 비교 대신 같은 부품·물건끼리 짝지어 확인, 이동 OFF 면 순간이동은 '참고'
+- 대시보드 3D Replay: 삭제 예고된 `st.components.v1.html` 대신 `st.iframe` (없는 이전 streamlit 에서는 기존 방식)
+- `src/__init__.py` `__version__` 0.1.0 -> 0.1.2 (v0.1.1 에서 갱신 누락)
+
+### Fixed
+- 세척기·UV기에 적재가 끝난 부품(`LOADING_END` ~ 인출 전)이 '대기(Waiting)'로 분류되던 버그 -> 'Processing'.
+  Replay 방별 작업/대기 수, `state_at`(--at), 이벤트 로그 state 열, `order_summary.csv` current_state 에 반영 (KPI 영향 없음)
+- 3D 실시간 Replay: 설비 상태 번호표가 두 개(MACHINE_STATES / STATE_COLORS 순서)라 Running <-> Idle 이 뒤바뀌어 보이던 버그.
+  번호표를 MACHINE_STATES 하나로 통일
+- Replay: 이동이 끝난 주문(예: ④ 도착 후 서포트 제거 대기)을 복도가 아니라 도착 방에 표시
+- `requirements.txt`: 한글 주석 때문에 한국어 Windows 의 pip 이 `UnicodeDecodeError` 로 설치 실패 -> 주석 영어로,
+  `dashboard/data.py` 가 쓰는 `pandas` 추가
+
+### Notes
+- 같은 시드에서 프린터 부하율 ρ 등 주요 KPI 는 v0.1.1 과 거의 같음. 이동 방식 변경으로 후공정 작업자 가동률이 낮아지고
+  (50.8% -> 46.3%, Normal seed 42) 단일 실행 시간은 약 1.8배 (약 23초 -> 41초)
+- 대시보드 1주 실행 결과는 빈 공장에서 시작하므로 발표용 숫자는 `--reps 30` 결과를 쓸 것
+
 ## v0.1.1 - 2026.10.07
 
 ### Added

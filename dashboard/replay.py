@@ -102,7 +102,7 @@ def _frame_traces(s, mpos):
         if room == "Corridor":
             ix.append(cx - 1.0)
             iy.append(y0 + h / 2)
-            itext.append(f"이동 대기 주문 {n}")
+            itext.append(f"운반 중 주문 {n}")
         else:
             ix.append(cx)
             iy.append(y1 - 0.85)
@@ -117,7 +117,9 @@ def _frame_traces(s, mpos):
     header = go.Scatter(
         x=[6.0], y=[8.55], mode="text", showlegend=False, hoverinfo="skip", textfont=dict(size=15),
         text=[f"<b>{s['label']}</b>   WIP {s['wip']}건 · 누적 완료 {s['completed']}건 · "
-              f"납기 지연(미완료) {s['late']}건 · 레진 누적 {s['resin_L']:.1f} L"],
+              f"납기 지연(미완료) {s['late']}건 · 레진 누적 {s['resin_L']:.1f} L<br>"
+              "<span style='font-size:12px'>실물 없음(전산): "
+              + " · ".join(f"{g} {n}" for g, n in s.get("virtual", {}).items()) + "</span>"],
     )
     return [machines, workers, info, header]
 

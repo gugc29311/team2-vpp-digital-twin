@@ -1,7 +1,8 @@
 simpy>=4.1,<5
 numpy>=1.24
-# 대시보드
+# dashboard (keep comments ASCII: pip on Korean Windows reads this file as cp949)
 streamlit>=1.50
 plotly>=5.18
-# 개발/테스트
+pandas
+# dev / test
 pytest>=7

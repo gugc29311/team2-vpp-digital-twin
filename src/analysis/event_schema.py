@@ -5,8 +5,11 @@
   process_of(event) : 명세서 8.1절 공정명. 매핑이 없으면 KeyError (새 이벤트를 추가하면 여기도 추가할 것)
   state_of(entity_type, event) : 이벤트 직후 대상의 상태
       *_QUEUE_ENTER            -> Waiting     (설비·자원 대기)
-      TRANSPORT_*_START        -> Moving
+      TRANSPORT_* / HANDOFF_* / RECEIVE_* / WALK / AMR_MOVE _START -> Moving
+          (HANDOFF = 작업 위치 -> 문 앞 선반, TRANSPORT = 운반(사람 또는 AMR), RECEIVE = 문 앞 선반 -> 작업 위치,
+           WALK = 작업자 빈손 이동, AMR_MOVE = AMR 빈 차 이동)
       *_START                  -> Processing
+      LOADING_END              -> Processing  (세척기·UV기에 적재 완료 = 설비 안에서 처리 중, 인출 전까지)
       *_END                    -> Waiting     (다음 공정 대기)
       PRINT_FAILED / INSPECTION_FAILED -> Failed,  SCRAPPED -> Scrapped
       PART_COMPLETED / ORDER_COMPLETED -> Done
@@ -21,6 +24,19 @@ MACHINE_STATES = ("Idle", "Setup", "Running", "Waiting", "Down", "Maintenance")
 _MACHINE_EVENT_STATE = {"IDLE_START": "Idle", "WAITING_START": "Waiting", "SETUP_START": "Setup",
                         "RUNNING_START": "Running", "DOWN_START": "Down", "MAINTENANCE_START": "Maintenance",
                         "CLEANING_START": "Maintenance"}
+
+# 실물이 없는 위치 (parameters.LOCATIONS 값). 화면·위치 연속성 검사에서 방과 구분
+VIRTUAL_LOCATION = "Virtual"
+
+# 이동 구간 이름(TRANSPORT_<구간>) -> (출발 공정, 도착 공정). 위치는 LOCATIONS 로 변환
+TRANSPORT_ROUTES = {
+    "1_PRINT_TO_REMOVAL": ("VPP Build", "Part Removal"),
+    "2_TO_WASHING": ("Part Removal", "Washing"),
+    "3_TO_UV": ("Washing", "UV Curing"),
+    "4_TO_SUPPORT": ("UV Curing", "Support Removal"),
+    "5_TO_INSPECTION": ("Surface Treatment", "Inspection"),
+    "6_TO_PACKING": ("Inspection", "Packaging"),
+}
 
 PROCESSES = ("Order Reception", "Job Assignment", "Batch Formation", "VPP Build", "Part Removal", "Washing",
              "UV Curing", "Support Removal", "Surface Treatment", "Inspection", "Packaging", "Transport")
@@ -58,9 +74,33 @@ def base_name(event):
     return event
 
 
+# 이동 이벤트 접두어: 운반 구간에 붙는 것(구간 이름이 뒤따름)과 단독 이동
+ROUTE_PREFIXES = ("TRANSPORT_", "HANDOFF_", "RECEIVE_")
+MOVE_BASES = ("WALK", "AMR_MOVE")
+
+
+def route_parts(event):
+    """'HANDOFF_2_TO_WASHING_END' -> ('HANDOFF_', '2_TO_WASHING'). 운반 구간 이벤트가 아니면 None."""
+    base = base_name(event)
+    for prefix in ROUTE_PREFIXES:
+        if base.startswith(prefix) and base[len(prefix):] in TRANSPORT_ROUTES:
+            return prefix, base[len(prefix):]
+    return None
+
+
+def transport_route(event):
+    """'TRANSPORT_2_TO_WASHING_START' (HANDOFF_/RECEIVE_ 도 같음) -> ('Part Removal', 'Washing'). 아니면 None."""
+    rp = route_parts(event)
+    return TRANSPORT_ROUTES[rp[1]] if rp else None
+
+
+def is_move(event):
+    return route_parts(event) is not None or base_name(event) in MOVE_BASES
+
+
 def process_of(event):
     base = base_name(event)
-    if base.startswith("TRANSPORT_"):
+    if base.startswith(ROUTE_PREFIXES) or base in MOVE_BASES:
         return "Transport"
     return _PROCESS[base]
 
@@ -71,7 +111,9 @@ def state_of(entity_type, event):
     if entity_type == "MACHINE":
         return _MACHINE_EVENT_STATE.get(event, "Idle")
     if event.endswith("_START"):
-        return "Moving" if event.startswith("TRANSPORT_") else "Processing"
+        return "Moving" if is_move(event) else "Processing"
+    if event == "LOADING_END":                 # 적재가 끝나면 부품은 설비 안에서 처리 중 (다음 이벤트는 처리 후 인출)
+        return "Processing"
     if event.endswith("_FAILED"):
         return "Failed"
     if event == "SCRAPPED":

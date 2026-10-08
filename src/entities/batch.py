@@ -25,6 +25,7 @@ class Batch:
     print_start: Optional[float] = None
     print_end: Optional[float] = None
     urgent: bool = False                 # 긴급 전용 배치 (URGENT_BATCH_MAX_WAIT_TIME 사용 시)
+    printer: Optional[str] = None        # 출력한 프린터 (P1, P2 …) — 장비 대별 KPI 용 기록
 
     @property
     def closed(self):

@@ -80,8 +80,9 @@ HAND_TRACE = [   # (이벤트, 시각 h) — 경쟁 없는 주문 1건, LOGIC_CF
     ("SURFACE_TREATMENT_START", 42), ("SURFACE_TREATMENT_END", 44),                         # 표면 2h
     ("TRANSPORT_5_TO_INSPECTION_START", 44), ("TRANSPORT_5_TO_INSPECTION_END", 44.5),
     ("INSPECTION_START", 44.5), ("INSPECTION_END", 45.5),                                   # 검사 1h
-    ("PACKAGING_START", 45.5), ("PACKAGING_END", 46.5),                                     # 포장 1h
-    ("PART_COMPLETED", 46.5), ("ORDER_COMPLETED", 46.5),
+    ("TRANSPORT_6_TO_PACKING_START", 45.5), ("TRANSPORT_6_TO_PACKING_END", 46),             # 검사실 -> 포장실
+    ("PACKAGING_START", 46), ("PACKAGING_END", 47),                                         # 포장 1h
+    ("PART_COMPLETED", 47), ("ORDER_COMPLETED", 47),
 ]
 
 
@@ -90,7 +91,7 @@ def test_level2_single_order_trace_matches_hand_calculation(logic_cfg):
     trace = order_trace(res, "O1")
     assert [r["event"] for r in trace] == [ev for ev, _ in HAND_TRACE]
     assert [r["t"] for r in trace] == pytest.approx([t for _, t in HAND_TRACE])
-    assert trace[0]["time"] == "Day 1 09:00 (월)" and trace[-1]["time"] == "Day 3 07:30 (수)"   # 09:00 + 46.5h
+    assert trace[0]["time"] == "Day 1 09:00 (월)" and trace[-1]["time"] == "Day 3 08:00 (수)"   # 09:00 + 47h
 
 
 def test_trace_includes_batch_and_load_events_of_that_order(run_logic):

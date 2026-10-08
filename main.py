@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-VPP Digital Twin 실행 진입점. 반드시 프로젝트 최상위 폴더에서 실행:
+VPP Digital Twin 실행 진입점. 어느 폴더에서 실행해도 프로젝트 최상위 폴더 기준으로 동작
+(data/ 를 읽고 outputs/ 에 저장. VS Code ▶ 실행 버튼도 가능):
 
   python main.py                                   # data/sample_orders.csv 로 공정 통과 확인 (추적 출력)
   python main.py --quiet                           # 요약만
@@ -48,6 +49,11 @@ def main():
     ap.add_argument("--at", help='시각 조회 "Day 3 14:25" (Day 1 = 월요일 09:00 시작). csv 모드 또는 --keep-events 필요')
     ap.add_argument("--trace", help="주문 1건 전체 이벤트 추적 (예: O001). csv 모드 또는 --keep-events 필요")
     args = ap.parse_args()
+    if args.orders:                                   # 사용자가 준 경로는 실행한 위치 기준 -> 절대경로로 고정
+        args.orders = os.path.abspath(args.orders)
+    if args.out != ap.get_default("out"):             # --out 도 실행한 위치 기준 (기본값 outputs 는 프로젝트 폴더)
+        args.out = os.path.abspath(args.out)
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))   # data/·outputs/ 상대경로 기준 = 프로젝트 최상위 폴더
     if args.preset and args.mode == "csv":
         ap.error("--preset 는 random 모드 전용")
     if args.preset and args.scenario:

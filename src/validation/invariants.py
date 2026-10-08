@@ -179,6 +179,7 @@ def check_transport(res):
       - 앞 공정이 끝나기 전에 이동을 출발하지 않음
       - 이동이 끝나기(도착) 전에 다음 공정·대기열에 들어가지 않음
     ① 출력 -> 탈거(배치) ② 탈거 -> 세척(세척 로드) ③ 세척 -> UV(UV 로드) ④ UV -> 서포트(UV 로드) ⑤ 표면처리 -> 검사(배치)
+    ⑥ 검사 -> 포장(배치의 합격품)
     """
     if not res.log.keep_events:
         return []
@@ -225,6 +226,10 @@ def check_transport(res):
                times([bid], "TRANSPORT_5_TO_INSPECTION_START", min))
         before(f"{bid} 이동⑤ 도착 -> 검사 시작", times([bid], "TRANSPORT_5_TO_INSPECTION_END", max),
                times(parts, "INSPECTION_START", min))
+        before(f"{bid} 검사 종료 -> 이동⑥ 출발", times(parts, "INSPECTION_END", max),
+               times([bid], "TRANSPORT_6_TO_PACKING_START", min))
+        before(f"{bid} 이동⑥ 도착 -> 포장 시작", times([bid], "TRANSPORT_6_TO_PACKING_END", max),
+               times(parts, "PACKAGING_START", min))
     return out
 
 

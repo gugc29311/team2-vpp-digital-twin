@@ -4,7 +4,7 @@ Level 5 극한 조건 테스트: 입력을 극단값으로 놓았을 때 결과�
 (고정 설정 LOGIC_CFG — 24시간 시계, 고정 처리시간, 한 배치 최대 4부품, 배치 대기 24h)
 
   0 수요     : 주문 없음 -> 오류 없이 종료, 배치·점유 0
-  경쟁 없음   : 주문 1건 -> 리드타임 = 처리시간 합 (손계산 46.5h)
+  경쟁 없음   : 주문 1건 -> 리드타임 = 처리시간 합 (손계산 47h, 이동 ①~⑥ 포함)
   자원 무한   : 사람·설비 대기 0
   과부하     : JA 부하 150% -> 시스템 내 주문이 계속 쌓임, 완료율 < 1
   불량 최대   : 불량 99% + 재출력 없음 -> 거의 전부 SHORT / 재출력 있음 -> 결국 전부 완료
@@ -47,10 +47,10 @@ def test_zero_demand_random_mode(logic_cfg):
 def test_single_order_lead_time_is_sum_of_process_times(logic_cfg):
     """
     JA 1 -> 배치 대기 24 (부품 1개라 시간 조건) -> 준비 2 -> 출력 5 -> ① 0.5 + 제거 1
-    -> ② 0.5 + 세척 2 -> ③ 0.5 + UV 3 -> ④ 0.5 -> 서포트 2 -> 표면 2 -> ⑤ 0.5 -> 검사 1 -> 포장 1 = 46.5h
+    -> ② 0.5 + 세척 2 -> ③ 0.5 + UV 3 -> ④ 0.5 -> 서포트 2 -> 표면 2 -> ⑤ 0.5 -> 검사 1 -> ⑥ 0.5 -> 포장 1 = 47h
     """
     res = VPPSimulation(logic_cfg, orders=[_order()]).run()
-    assert res.orders[0].completed_time == pytest.approx(46.5)
+    assert res.orders[0].completed_time == pytest.approx(47)
 
 
 def _resource_waits(res):

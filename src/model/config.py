@@ -134,6 +134,27 @@ class SimConfig:
                     raise ValueError(f"EQUIPMENT_FAILURE['{eq}']: mtbf, pm_every 는 양수")
         if v["CLEANING_LIQUID_CHANGE_EVERY_LOADS"] is not None and v["CLEANING_LIQUID_CHANGE_EVERY_LOADS"] < 1:
             raise ValueError("CLEANING_LIQUID_CHANGE_EVERY_LOADS 는 1 이상 또는 None")
+        if v["TRANSPORT_MODE"] not in ("amr", "worker"):
+            raise ValueError("TRANSPORT_MODE 는 'amr' 또는 'worker'")
+        if v["MOVE_TIME_MODE"] not in ("distance", "fixed"):
+            raise ValueError("MOVE_TIME_MODE 는 'distance' 또는 'fixed'")
+        if v["TRANSPORT_MODE"] == "amr" and v["MOVE_TIME_MODE"] != "distance":
+            raise ValueError("TRANSPORT_MODE='amr' 는 MOVE_TIME_MODE='distance' 와 함께 써야 함 (AMR 주행시간 = 거리 ÷ 속도)")
+        if v["MOVE_TIME_MODE"] == "distance":
+            rooms = {r for r in v["LOCATIONS"].values() if r not in ("Virtual", "Corridor")}
+            miss = sorted(rooms - set(v["ROOM_DOOR_X_M"]))
+            if miss:
+                raise ValueError(f"ROOM_DOOR_X_M 에 방 문 위치가 없음: {miss}")
+            for k in ("WALK_SPEED_M_S", "CARRY_SPEED_M_S", "AMR_SPEED_M_S"):
+                if not v[k] > 0:
+                    raise ValueError(f"{k} 는 양수")
+            if v["ROOM_DEPTH_M"] < 0:
+                raise ValueError("ROOM_DEPTH_M 는 0 이상")
+        if v["TRANSPORT_MODE"] == "amr":
+            if int(v["AMR_COUNT"]) < 1:
+                raise ValueError("AMR_COUNT 는 1 이상 (AMR 모드)")
+            if v["AMR_HOME"] not in v["ROOM_DOOR_X_M"]:
+                raise ValueError("AMR_HOME 은 ROOM_DOOR_X_M 의 방 이름")
         if v["USE_WORK_CALENDAR"]:
             for s, e in v["WORK_WINDOWS"]:
                 if not 0 <= s < e <= 24:

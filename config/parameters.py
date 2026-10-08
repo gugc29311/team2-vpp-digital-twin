@@ -124,18 +124,47 @@ PRINTER_UNATTENDED = True            # 투입은 근무시간에만, 출력은 �
 # =========================================================
 # Transportation  [공통4]  받는 쪽 작업자가 소모, 설비는 점유하지 않음
 #   ① 출력→탈거(배치) ② 탈거→세척(세척 로드) ③ 세척→UV(UV 로드) ④ UV→서포트(UV 로드) ⑤ 표면처리→검사(배치)
+#   ⑥ 검사→포장(배치의 합격품, 포장 담당 / 없으면 검사원) — 검사실·포장실이 다른 방이라 이동 추가
+#   AMR 모드에서 문 앞 선반까지 들고 나오는 사람(보내는 쪽): ①~⑤ 후공정 작업자, ⑥ 검사원
+#   불량 부품은 폐기 후 같은 파일로 새로 출력하므로 프린터실로 옮기는 이동은 없음
 # =========================================================
 TRANSPORT_ENABLED = True
-DEFAULT_TRANSPORT_TIME = ("tri", 1, 2, 4, "min")    # 레이아웃 의존
+# 운반 주체: "amr" = 보내는 사람이 문 앞 선반에 놓음 -> AMR 이 복도로 운반해 도착 방 문 앞 선반에 자동 하역
+#                    -> 받는 사람이 선반에서 꺼내 방 안으로  (회사 AMR 보유 확인, 운용 방식은 ⚠️ 인터뷰 확인)
+#           "worker" = 받는 쪽 작업자가 출발 방 작업 위치 -> 도착 방 작업 위치까지 직접 들고 감 (비교 시나리오)
+TRANSPORT_MODE = "amr"
+# 이동시간: "distance" = 거리 ÷ 속도 (아래 가정 배치도). 작업자의 빈손 이동(다음 작업 장소로 걷기)도 모두 포함
+#           "fixed"    = 운반 1회 = DEFAULT_TRANSPORT_TIME, 빈손 이동 없음 (기존 방식, 로직 테스트용 · worker 모드 전용)
+MOVE_TIME_MODE = "distance"
+DEFAULT_TRANSPORT_TIME = ("tri", 1, 2, 4, "min")    # fixed 모드에서만 사용 ⚠️
 
-# 공정(명세서 8.1절) -> 방 이름. 이벤트 로그 location 열에만 쓰임 (좌표·거리·이동시간과 무관)
-# 가정값 — 실제 공장 배치는 인터뷰 확인 필요
-# 주문은 온라인으로 접수 -> 별도 주문 데스크 없음. 접수·작업 배정·배치 구성은 프린터실에서 처리
+# 가정 배치도 ⚠️ (실제 배치는 인터뷰 확인): 일자형 복도 양쪽에 방, 방마다 복도 쪽 문 1개.
+#   문 위치 = 복도 왼쪽 끝에서 문까지 거리 [m]. 대시보드 Replay 그림과 같은 배치 (화면 1칸 = 2.5 m)
+#   방 안 작업 위치 <-> 문(복도 가운데) 거리 = ROOM_DEPTH_M
+#   두 방 사이 이동 거리 = 출발 깊이 + |문 위치 차이| + 도착 깊이 (같은 방이면 0, 문 <-> 작업 위치면 깊이만)
+ROOM_DOOR_X_M = {
+    "Print Room": 7.4, "Post-processing Room": 22.6,                 # 복도 위쪽
+    "Packing Room": 3.6, "Inspection Room": 11.2, "UV Room": 18.8, "Wash Room": 26.4,   # 복도 아래쪽
+}
+ROOM_DEPTH_M = 2.5
+WALK_SPEED_M_S = 1.0                 # 빈손 걷기 ⚠️
+CARRY_SPEED_M_S = 0.8                # 짐 들고 걷기 ⚠️
+SHELF_HANDLING_TIME = ("const", 10, "s")   # 사람이 문 앞 선반에 놓기 / 꺼내기 1회 ⚠️
+
+# AMR (TRANSPORT_MODE = "amr")  ⚠️ 전부 가정값 — 대수·속도·하역 방식 인터뷰 확인
+AMR_COUNT = 2
+AMR_SPEED_M_S = 1.0                  # 복도 주행 속도
+AMR_TRANSFER_TIME = ("const", 15, "s")     # 선반에서 자동 적재 / 선반에 자동 하역 1회
+AMR_HOME = "Print Room"              # 시작 위치 (그 방 문 앞)
+
+# 공정(명세서 8.1절) -> 방 이름. 이벤트 로그 location 열과 이동 거리(ROOM_DOOR_X_M)에 쓰임
+# ⚠️ 가정값 — 실제 공장 배치는 인터뷰 확인 필요
+# 주문은 온라인으로 접수 -> 별도 주문 데스크 없음. 작업 배정은 프린터실 PC 에서 처리
+# "Virtual" = 실물이 없는 정보 처리 단계 (접수, 배치 구성 = 출력 파일 묶기). 부품은 출력 시작부터 실물로 존재
 LOCATIONS = {
-    "Order Reception": "Print Room",
+    "Order Reception": "Virtual",
     "Job Assignment": "Print Room",
-    "Batch Formation": "Print Room",
-
+    "Batch Formation": "Virtual",
     "VPP Build": "Print Room",
     "Part Removal": "Post-processing Room",
     "Washing": "Wash Room",

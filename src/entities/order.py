@@ -126,6 +126,8 @@ class Part:
     gen: int = 0                  # 재출력 횟수
     resin_mm3: Optional[float] = None   # 출력 시 소모한 레진 (RESIN_TRACKING)
     base_id: Optional[str] = None       # 최초 부품 번호 (재출력돼도 유지) — 문자열 파싱 없이 재출력 번호 생성
+    batch: Optional[object] = None      # 들어간 배치 (Batch) — 주문 단계별 시간 KPI 용 기록
+    batched_time: Optional[float] = None   # 배치에 들어간 시각 (= 작업 배정 완료)
 
     def __post_init__(self):
         if self.base_id is None:

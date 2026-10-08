@@ -16,7 +16,9 @@ from src.model.simulation import VPPSimulation
 EXPECTED_NORMAL = {
     "printer_rho": (0.77, 0.83),
     "util_job_assignment_workers": (0.55, 0.61),
-    "util_post_process_workers": (0.48, 0.53),
+    # 2026-10-07: 이동을 '거리 ÷ 속도 + AMR 운반'으로 바꾸며 운반 1회가 평균 2.3분 -> 수십 초로 줄어 46% 대로 낮아짐
+    #             (기존 Tri(1,2,4)분 사람 운반 기준 범위는 0.48~0.53). seed 42: AMR 0.463 / 사람 운반 0.455
+    "util_post_process_workers": (0.44, 0.49),
     "util_quality_inspectors": (0.53, 0.59),
     "mean_batch_size": (28.0, 29.0),
     "mean_build_time_h": (3.65, 3.75),

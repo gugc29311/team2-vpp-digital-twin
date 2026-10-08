@@ -135,14 +135,29 @@ class FactoryResources:
         self.packers = simpy.Resource(env, capacity=cfg.PACKER_COUNT) if cfg.PACKER_COUNT else None
         self.printer_operators = (simpy.Resource(env, capacity=cfg.PRINTER_OPERATOR_COUNT)
                                   if cfg.PRINTER_OPERATOR_COUNT else None)
+        # AMR (운반 로봇): 대기열 + 개별 ID (AMR1, AMR2 …)
+        use_amr = cfg.TRANSPORT_ENABLED and cfg.TRANSPORT_MODE == "amr"
+        self.amrs = simpy.Resource(env, capacity=cfg.AMR_COUNT) if use_amr else None
+        self.amr_ids = [f"AMR{i + 1}" for i in range(cfg.AMR_COUNT)] if use_amr else []
+        self.amr_free = list(self.amr_ids)
         # 개인 ID: 역할 -> 전체 목록 / 지금 비어 있는 번호(최소 힙)
         self.workers = {role: worker_ids(role, self.capacity_of(role)) for role in WORKER_PREFIX
                         if self.capacity_of(role) > 0}
         self._free = {role: list(range(len(ids))) for role, ids in self.workers.items()}
 
-    def take_worker(self, role):
-        """대기열 자리를 받은 직후 호출: 빈 사람 중 번호가 가장 작은 사람의 ID (yield 없음)."""
-        return self.workers[role][heapq.heappop(self._free[role])]
+    def take_worker(self, role, key=None):
+        """
+        대기열 자리를 받은 직후 호출 (yield 없음): 빈 사람 중 번호가 가장 작은 사람의 ID.
+        key(작업자 ID) 를 주면 그 값(작업 장소까지 거리)이 가장 작은 사람, 같으면 번호가 작은 사람.
+        """
+        free = self._free[role]
+        if key is None:
+            return self.workers[role][heapq.heappop(free)]
+        ids = self.workers[role]
+        i = min(free, key=lambda j: (key(ids[j]), j))
+        free.remove(i)
+        heapq.heapify(free)
+        return ids[i]
 
     def release_worker(self, role, worker_id):
         heapq.heappush(self._free[role], self.workers[role].index(worker_id))
@@ -160,4 +175,5 @@ class FactoryResources:
     # 가동률 계산 대상: (자원 이름, 사람이면 True)
     TRACKED = (("vpp_printers", False), ("washing_machines", False), ("uv_curing_machines", False),
                ("job_assignment_workers", True), ("post_process_workers", True),
-               ("quality_inspectors", True), ("packers", True), ("printer_operators", True))
+               ("quality_inspectors", True), ("packers", True), ("printer_operators", True),
+               ("amrs", False))
